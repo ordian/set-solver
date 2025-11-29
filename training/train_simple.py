@@ -740,7 +740,7 @@ def test_onnx(image_path: str):
     # Load ONNX models
     # ----------------------------
     yolo_sess = ort.InferenceSession(
-        "../docs/segmentation.onnx", providers=["CPUExecutionProvider"]
+        "../docs/segmentationv2.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
         "../docs/classification.onnx", providers=["CPUExecutionProvider"]
@@ -752,6 +752,67 @@ def test_onnx(image_path: str):
     # Must match your 640x640 or 640x480 export size
     # ----------------------------
     YOLO_W, YOLO_H = 640, 480  # adjust if your detector export shape is different
+
+    def yolo11_decode_cxcywh(raw, conf_thresh=0.5):
+        raw = np.asarray(raw, dtype=np.float32).squeeze()  # (5,6300)
+
+        cx = raw[0]
+        cy = raw[1]
+        w = raw[2]
+        h = raw[3]
+        conf = raw[4]
+
+        keep = conf > conf_thresh
+
+        cx = cx[keep]
+        cy = cy[keep]
+        w = w[keep]
+        h = h[keep]
+        conf = conf[keep]
+
+        # convert center to corner
+        x1 = cx - w / 2
+        y1 = cy - h / 2
+        x2 = cx + w / 2
+        y2 = cy + h / 2
+
+        # filter out invalid shapes
+        valid = (x2 > x1) & (y2 > y1)
+        x1, y1, x2, y2, conf = x1[valid], y1[valid], x2[valid], y2[valid], conf[valid]
+
+        boxes = np.stack([x1, y1, x2, y2, conf, np.zeros_like(conf)], axis=1)
+        return boxes
+
+    def nms(boxes, iou_thresh=0.45):
+        if len(boxes) == 0:
+            return boxes
+
+        b = boxes.copy()
+        x1, y1, x2, y2, score, cls = b.T
+
+        idxs = np.argsort(-score)
+        keep = []
+
+        while len(idxs) > 0:
+            i = idxs[0]
+            keep.append(i)
+
+            xx1 = np.maximum(x1[i], x1[idxs[1:]])
+            yy1 = np.maximum(y1[i], y1[idxs[1:]])
+            xx2 = np.minimum(x2[i], x2[idxs[1:]])
+            yy2 = np.minimum(y2[i], y2[idxs[1:]])
+
+            w = np.maximum(0, xx2 - xx1)
+            h = np.maximum(0, yy2 - yy1)
+            inter = w * h
+
+            area_i = (x2[i] - x1[i]) * (y2[i] - y1[i])
+            area_j = (x2[idxs[1:]] - x1[idxs[1:]]) * (y2[idxs[1:]] - y1[idxs[1:]])
+            iou = inter / (area_i + area_j - inter + 1e-9)
+
+            idxs = idxs[1:][iou < iou_thresh]
+
+        return b[keep]
 
     def preprocess_yolo(img):
         """Resize + normalize to shape (1,3,H,W)."""
@@ -789,22 +850,10 @@ def test_onnx(image_path: str):
     yolo_input_name = yolo_sess.get_inputs()[0].name
     yolo_out = yolo_sess.run(None, {yolo_input_name: yolo_inp})
 
-    # Ultralytics ONNX typically returns a single Nx6 matrix: [x1,y1,x2,y2,conf,class]
-    def parse_yolo11_onnx_output(out, conf_threshold=0.25):
-        arr = np.array(out[0])  # (1,300,6)
-        arr = arr[0]  # (300,6)
-
-        # Filter out invalid rows: YOLO pads empty detections with zeros
-        valid = arr[:, 4] > conf_threshold
-        arr = arr[valid]
-
-        return arr
-
-    det_out = parse_yolo11_onnx_output(yolo_out)
-    print("Detections:", det_out.shape)
-    boxes = det_out
-
-    print(f"\nDetected {len(boxes)} cards:")
+    decoded = yolo11_decode_cxcywh(yolo_out, conf_thresh=0.6)
+    print("After threshold:", decoded.shape)
+    boxes = nms(decoded, iou_thresh=0.3)
+    print("After NMS:", boxes.shape)
 
     draw = ImageDraw.Draw(img)
     color_map = {"red": "#FF4444", "green": "#44FF44", "purple": "#AA44FF"}
@@ -866,8 +915,7 @@ def export():
             format="onnx",
             imgsz=(480, 640),
             opset=18,
-            nms=True,
-            dynamic=False,
+            nms=False,  # Web backend doesn't support the instructions :(
         )
         print(f"Detector exported")
 
