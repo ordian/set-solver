@@ -23,6 +23,17 @@
             #status {
                 margin-top: 1rem;
             }
+            #perfBox {
+                position: absolute;
+                top: 10px;
+                right: 10px;
+                background: rgba(0, 0, 0, 0.6);
+                color: white;
+                padding: 6px 10px;
+                border-radius: 6px;
+                font-size: 14px;
+                pointer-events: none;
+            }
         </style>
     </head>
     <body>
@@ -37,119 +48,87 @@
             ></canvas>
             <canvas id="displayCanvas" width="640" height="480"></canvas>
             <div id="status">Loading models...</div>
+            <div id="perfBox">seg: -, clf: -, set: -</div>
         </div>
 
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
         <script>
-            // =================================================
-            // CANVAS AND DOM
-            // =================================================
-            const video = document.getElementById("video");
-            const captureCanvas = document.getElementById("captureCanvas");
-            const displayCanvas = document.getElementById("displayCanvas");
-            const capCtx = captureCanvas.getContext("2d");
-            const dispCtx = displayCanvas.getContext("2d");
-            const statusEl = document.getElementById("status");
+            let tSeg = 0,
+                tClf = 0,
+                tSet = 0;
+            let lastSets = [];
+            let lastSetTime = 0;
+            const SET_HOLD_MS = 2000;
 
-            // =================================================
-            // CONSTANTS
-            // =================================================
             const COLORS = ["red", "green", "purple"];
             const SHAPES = ["diamond", "oval", "squiggle"];
             const FILLS = ["solid", "striped", "empty"];
             const COUNTS = ["one", "two", "three"];
-
-            const YOLO_W = 640;
-            const YOLO_H = 480;
-            const IMG_SIZE = 224;
-            const CONF_THRESH = 0.6;
-            const IOU_THRESH = 0.3;
-
-            const TARGET_FPS = 4;
+            const YOLO_W = 640,
+                YOLO_H = 480,
+                IMG_SIZE = 224;
+            const CONF_THRESH = 0.6,
+                IOU_THRESH = 0.3,
+                TARGET_FPS = 4;
             let lastFrameTime = 0;
 
-            let yoloSession, clfSession;
+            const video = document.getElementById("video");
+            const captureCanvas = document.getElementById("captureCanvas");
+            const displayCanvas = document.getElementById("displayCanvas");
+            const statusEl = document.getElementById("status");
+            const perfBox = document.getElementById("perfBox");
+            const capCtx = captureCanvas.getContext("2d");
+            const dispCtx = displayCanvas.getContext("2d");
 
-            // Preallocated crop canvas
+            let yoloSession, clfSession;
             const cropCanvas = document.createElement("canvas");
-            cropCanvas.width = 300;
-            cropCanvas.height = 300;
             const cropCtx = cropCanvas.getContext("2d");
 
-            captureCanvas.width = YOLO_W;
-            captureCanvas.height = YOLO_H;
-            displayCanvas.width = YOLO_W;
-            displayCanvas.height = YOLO_H;
-
-            // =================================================
-            // PREPROCESS YOLO
-            // =================================================
             function preprocessYOLO() {
                 capCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
                 const img = capCtx.getImageData(0, 0, YOLO_W, YOLO_H);
                 const d = img.data;
-
-                const data = new Float32Array(1 * 3 * YOLO_H * YOLO_W);
-                const plane = YOLO_W * YOLO_H;
-
-                let rOfs = 0,
-                    gOfs = plane,
-                    bOfs = plane * 2;
-                let px = 0;
-
-                for (let y = 0; y < YOLO_H; y++) {
-                    for (let x = 0; x < YOLO_W; x++, px++) {
-                        const i = px * 4;
-                        data[rOfs++] = d[i] / 255;
-                        data[gOfs++] = d[i + 1] / 255;
-                        data[bOfs++] = d[i + 2] / 255;
-                    }
+                const out = new Float32Array(3 * YOLO_W * YOLO_H);
+                let r = 0,
+                    g = YOLO_W * YOLO_H,
+                    b = 2 * YOLO_W * YOLO_H;
+                for (let i = 0; i < d.length; i += 4) {
+                    out[r++] = d[i] / 255;
+                    out[g++] = d[i + 1] / 255;
+                    out[b++] = d[i + 2] / 255;
                 }
-
-                return new ort.Tensor("float32", data, [1, 3, YOLO_H, YOLO_W]);
+                return new ort.Tensor("float32", out, [1, 3, YOLO_H, YOLO_W]);
             }
 
-            // =================================================
-            // CLASSIFIER preprocess
-            // =================================================
             const mean = [0.485, 0.456, 0.406];
             const std = [0.229, 0.224, 0.225];
-
-            function preprocessClassifier(cropW, cropH) {
-                const resized = document.createElement("canvas");
-                resized.width = IMG_SIZE;
-                resized.height = IMG_SIZE;
-
-                const r2 = resized.getContext("2d");
-                r2.drawImage(
+            function preprocessClassifier(w, h) {
+                const tmp = document.createElement("canvas");
+                tmp.width = IMG_SIZE;
+                tmp.height = IMG_SIZE;
+                const tctx = tmp.getContext("2d");
+                tctx.drawImage(
                     cropCanvas,
                     0,
                     0,
-                    cropW,
-                    cropH,
+                    w,
+                    h,
                     0,
                     0,
                     IMG_SIZE,
                     IMG_SIZE,
                 );
-
-                const img = r2.getImageData(0, 0, IMG_SIZE, IMG_SIZE);
-                const d = img.data;
-
-                const data = new Float32Array(1 * 3 * IMG_SIZE * IMG_SIZE);
-                const plane = IMG_SIZE * IMG_SIZE;
-
-                let rOfs = 0,
-                    gOfs = plane,
-                    bOfs = plane * 2;
-
-                for (let i = 0, px = 0; i < d.length; i += 4, px++) {
-                    data[rOfs++] = (d[i] / 255 - mean[0]) / std[0];
-                    data[gOfs++] = (d[i + 1] / 255 - mean[1]) / std[1];
-                    data[bOfs++] = (d[i + 2] / 255 - mean[2]) / std[2];
+                const img = tctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE).data;
+                const out = new Float32Array(3 * IMG_SIZE * IMG_SIZE);
+                let r = 0,
+                    g = IMG_SIZE * IMG_SIZE,
+                    b = 2 * IMG_SIZE * IMG_SIZE;
+                for (let i = 0; i < img.length; i += 4) {
+                    out[r++] = (img[i] / 255 - mean[0]) / std[0];
+                    out[g++] = (img[i + 1] / 255 - mean[1]) / std[1];
+                    out[b++] = (img[i + 2] / 255 - mean[2]) / std[2];
                 }
-
-                return new ort.Tensor("float32", data, [
+                return new ort.Tensor("float32", out, [
                     1,
                     3,
                     IMG_SIZE,
@@ -157,96 +136,58 @@
                 ]);
             }
 
-            // ===============================================================
-            // YOLO11 OUTPUT FORMAT (cx, cy, w, h, conf) FOR 6300 CELLS
-            // ===============================================================
-            function decodeYOLO_CXCYWH(raw) {
-                // raw output0 → [1,1,5,6300]
+            function decodeYOLO(raw) {
                 const arr = raw.data;
                 const stride = 6300;
-
-                const cxArr = arr.subarray(0, stride);
-                const cyArr = arr.subarray(stride, stride * 2);
-                const wArr = arr.subarray(stride * 2, stride * 3);
-                const hArr = arr.subarray(stride * 3, stride * 4);
-                const confArr = arr.subarray(stride * 4, stride * 5);
-
-                const boxes = [];
-
+                const cx = arr.subarray(0, stride),
+                    cy = arr.subarray(stride, 2 * stride),
+                    w = arr.subarray(2 * stride, 3 * stride),
+                    h = arr.subarray(3 * stride, 4 * stride),
+                    conf = arr.subarray(4 * stride, 5 * stride);
+                const out = [];
                 for (let i = 0; i < stride; i++) {
-                    const conf = confArr[i];
-                    if (conf < CONF_THRESH) continue;
-
-                    const cx = cxArr[i];
-                    const cy = cyArr[i];
-                    const w = wArr[i];
-                    const h = hArr[i];
-
-                    const x1 = cx - w / 2;
-                    const y1 = cy - h / 2;
-                    const x2 = cx + w / 2;
-                    const y2 = cy + h / 2;
-
+                    if (conf[i] < CONF_THRESH) continue;
+                    const x1 = cx[i] - w[i] / 2,
+                        y1 = cy[i] - h[i] / 2,
+                        x2 = cx[i] + w[i] / 2,
+                        y2 = cy[i] + h[i] / 2;
                     if (x2 <= x1 || y2 <= y1) continue;
-
-                    boxes.push([x1, y1, x2, y2, conf]);
+                    out.push([x1, y1, x2, y2, conf[i]]);
                 }
-
-                return boxes;
+                return out;
             }
 
-            // ===============================================================
-            // NMS
-            // ===============================================================
             function iou(a, b) {
-                const x1 = Math.max(a[0], b[0]);
-                const y1 = Math.max(a[1], b[1]);
-                const x2 = Math.min(a[2], b[2]);
-                const y2 = Math.min(a[3], b[3]);
-
-                const w = Math.max(0, x2 - x1);
-                const h = Math.max(0, y2 - y1);
+                const x1 = Math.max(a[0], b[0]),
+                    y1 = Math.max(a[1], b[1]),
+                    x2 = Math.min(a[2], b[2]),
+                    y2 = Math.min(a[3], b[3]);
+                const w = Math.max(0, x2 - x1),
+                    h = Math.max(0, y2 - y1);
                 const inter = w * h;
-                if (inter <= 0) return 0;
-
-                const areaA = (a[2] - a[0]) * (a[3] - a[1]);
-                const areaB = (b[2] - b[0]) * (b[3] - b[1]);
+                if (!inter) return 0;
+                const areaA = (a[2] - a[0]) * (a[3] - a[1]),
+                    areaB = (b[2] - b[0]) * (b[3] - b[1]);
                 return inter / (areaA + areaB - inter);
             }
-
             function nms(boxes) {
-                if (boxes.length === 0) return [];
-
-                boxes.sort((a, b) => b[4] - a[4]); // sort by conf desc
+                boxes.sort((a, b) => b[4] - a[4]);
                 const keep = [];
-
-                while (boxes.length > 0) {
+                while (boxes.length) {
                     const a = boxes.shift();
                     keep.push(a);
-
                     boxes = boxes.filter((b) => iou(a, b) < IOU_THRESH);
                 }
-
                 return keep;
             }
-
-            // =================================================
-            // Argmax
-            // =================================================
-            function argmax(arr) {
-                let max = arr[0],
+            function argmax(t) {
+                let m = t[0],
                     idx = 0;
-                for (let i = 1; i < arr.length; i++)
-                    if (arr[i] > max) {
-                        max = arr[i];
-                        idx = i;
-                    }
+                for (let i = 1; i < t.length; i++)
+                    if (t[i] > m) (m = t[i]), (idx = i);
                 return idx;
             }
 
-            // =================================================
-            // SET detection logic
-            // =================================================
             function attrOK(x, y, z) {
                 return (x === y && y === z) || (x !== y && x !== z && y !== z);
             }
@@ -258,9 +199,8 @@
                     attrOK(a.count, b.count, c.count)
                 );
             }
-
             function findSets(cards) {
-                const sets = [];
+                const out = [];
                 for (let i = 0; i < cards.length; i++)
                     for (let j = i + 1; j < cards.length; j++)
                         for (let k = j + 1; k < cards.length; k++)
@@ -271,89 +211,81 @@
                                     cards[k].attrs,
                                 )
                             )
-                                sets.push([i, j, k]);
-                return sets;
+                                out.push([i, j, k]);
+                return out;
             }
 
-            // =================================================
-            // MAIN LOOP
-            // =================================================
-            async function loop(time) {
-                if (time - lastFrameTime < 1000 / TARGET_FPS) {
-                    requestAnimationFrame(loop);
-                    return;
-                }
-                lastFrameTime = time;
-
-                const yoloInput = preprocessYOLO();
-                const yoloOut = await yoloSession.run({
-                    [yoloSession.inputNames[0]]: yoloInput,
+            async function loop(t) {
+                if (t - lastFrameTime < 1000 / TARGET_FPS)
+                    return requestAnimationFrame(loop);
+                lastFrameTime = t;
+                let t0 = performance.now();
+                const yIn = preprocessYOLO();
+                const yOut = await yoloSession.run({
+                    [yoloSession.inputNames[0]]: yIn,
                 });
-
-                const raw = yoloOut[yoloSession.outputNames[0]];
-                const dets = nms(decodeYOLO_CXCYWH(raw));
-
+                const dets = nms(decodeYOLO(yOut[yoloSession.outputNames[0]]));
+                tSeg = performance.now() - t0;
                 dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
-
+                let t1 = performance.now();
                 const cards = [];
-
-                for (let d = 0; d < dets.length; d++) {
-                    const [x1, y1, x2, y2, conf] = dets[d];
-                    const w = (x2 - x1) | 0;
-                    const h = (y2 - y1) | 0;
-
+                for (const [x1, y1, x2, y2, conf] of dets) {
+                    const w = (x2 - x1) | 0,
+                        h = (y2 - y1) | 0;
                     if (w < 5 || h < 5) continue;
-
-                    // crop for classifier
                     cropCanvas.width = w;
                     cropCanvas.height = h;
                     cropCtx.drawImage(displayCanvas, x1, y1, w, h, 0, 0, w, h);
-
-                    // classify
-                    const clfInput = preprocessClassifier(w, h);
+                    const clfIn = preprocessClassifier(w, h);
                     const out = await clfSession.run({
-                        [clfSession.inputNames[0]]: clfInput,
+                        [clfSession.inputNames[0]]: clfIn,
                     });
-
-                    const card = {
-                        box: [x1, y1, x2, y2],
-                        attrs: {
-                            color: COLORS[argmax(out.color.data)],
-                            shape: SHAPES[argmax(out.shape.data)],
-                            fill: FILLS[argmax(out.fill.data)],
-                            count: COUNTS[argmax(out.count.data)],
-                        },
+                    const attrs = {
+                        color: COLORS[argmax(out.color.data)],
+                        shape: SHAPES[argmax(out.shape.data)],
+                        fill: FILLS[argmax(out.fill.data)],
+                        count: COUNTS[argmax(out.count.data)],
                     };
+                    cards.push({ box: [x1, y1, x2, y2], attrs });
+                }
+                tClf = performance.now() - t1;
 
-                    cards.push(card);
+                let t2 = performance.now();
+                const found = findSets(cards);
+                tSet = performance.now() - t2;
+
+                let showSets = found;
+                const now = performance.now();
+                if (found.length > 0) {
+                    lastSets = found;
+                    lastSetTime = now;
+                } else if (now - lastSetTime < SET_HOLD_MS) {
+                    showSets = lastSets;
+                } else {
+                    showSets = [];
                 }
 
-                // draw detections
-                dispCtx.lineWidth = 2;
-                dispCtx.strokeStyle = "lime";
-
+                const colors = ["#00FF00", "#FFFF00", "#3399FF"];
                 for (const c of cards) {
                     const [x1, y1, x2, y2] = c.box;
+                    dispCtx.strokeStyle = "lime";
+                    dispCtx.lineWidth = 2;
                     dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
                 }
-
-                // highlight SETs
-                const sets = findSets(cards);
-                for (const trip of sets) {
-                    for (const idx of trip) {
+                for (let s = 0; s < showSets.length; s++) {
+                    const col = colors[s % colors.length];
+                    dispCtx.strokeStyle = col;
+                    dispCtx.lineWidth = 4;
+                    for (const idx of showSets[s]) {
                         const [x1, y1, x2, y2] = cards[idx].box;
-                        dispCtx.strokeStyle = "red";
-                        dispCtx.lineWidth = 4;
                         dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
                     }
                 }
 
+                perfBox.textContent = `seg: ${tSeg.toFixed(1)}ms, clf: ${tClf.toFixed(1)}ms, set: ${tSet.toFixed(1)}ms`;
                 requestAnimationFrame(loop);
             }
 
-            // =================================================
-            // INIT
-            // =================================================
             async function init() {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: {
@@ -363,8 +295,6 @@
                     },
                 });
                 video.srcObject = stream;
-                // ort.env.logLevel = "verbose";
-
                 yoloSession = await ort.InferenceSession.create(
                     "segmentationv2.onnx",
                     { executionProviders: ["webgpu"] },
@@ -373,13 +303,10 @@
                     "classification.onnx",
                     { executionProviders: ["webgpu"] },
                 );
-
                 statusEl.textContent = "Models loaded.";
                 requestAnimationFrame(loop);
             }
-
             init();
         </script>
-        <!-- Updated script inserted below -->
     </body>
 </html>
