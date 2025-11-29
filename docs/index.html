@@ -39,7 +39,7 @@
             <div id="status">Loading models...</div>
         </div>
 
-        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/webgpu/ort.webgpu.min.js"></script>
         <script>
             // =================================================
             // CANVAS AND DOM
@@ -322,10 +322,18 @@
                 });
                 video.srcObject = stream;
 
-                yoloSession =
-                    await ort.InferenceSession.create("segmentation.onnx");
+                ort.env.logLevel = "verbose";
+                yoloSession = await ort.InferenceSession.create(
+                    "segmentation.onnx",
+                    {
+                        executionProviders: ["webgpu"],
+                    },
+                );
                 clfSession = await ort.InferenceSession.create(
                     "classification.onnx",
+                    {
+                        executionProviders: ["webgpu"],
+                    },
                 );
 
                 statusEl.textContent = "Models loaded.";
