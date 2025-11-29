@@ -67,9 +67,11 @@
             let tSeg = 0,
                 tClf = 0,
                 tSet = 0;
-            let lastSets = [];
-            let lastSetTime = 0;
-            const SET_HOLD_MS = 2000;
+            let lastDetections = []; // boxes + attrs
+            let lastFoundSets = [];
+            let lastUpdateTime = 0;
+            const HOLD_MS = 2500; // keep UI for 2.5s
+            let isProcessing = false; // avoid double-executing classifier
 
             const COLORS = ["red", "green", "purple"];
             const SHAPES = ["diamond", "oval", "squiggle"];
@@ -227,9 +229,52 @@
             }
 
             async function loop(t) {
-                if (t - lastFrameTime < 1000 / TARGET_FPS)
-                    return requestAnimationFrame(loop);
+                requestAnimationFrame(loop);
+
+                // Always draw the latest stable frame
+                dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+
+                drawPersistentResults();
+
+                // If running classifier — do nothing
+                if (isProcessing) return;
+
+                // Enforce FPS limit
+                if (t - lastFrameTime < 1000 / TARGET_FPS) return;
                 lastFrameTime = t;
+
+                // Start async processing (doesn't block rendering)
+                processFrame();
+            }
+
+            function drawPersistentResults() {
+                const now = performance.now();
+                if (now - lastUpdateTime > HOLD_MS) return;
+
+                // Draw boxes
+                for (const c of lastDetections) {
+                    const [x1, y1, x2, y2] = c.box;
+                    dispCtx.strokeStyle = "lime";
+                    dispCtx.lineWidth = 2;
+                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                }
+
+                // Draw sets
+                const colors = ["#00FF00", "#FFFF00", "#3399FF"];
+                for (let s = 0; s < lastFoundSets.length; s++) {
+                    const color = colors[s % colors.length];
+                    dispCtx.strokeStyle = color;
+                    dispCtx.lineWidth = 4;
+                    for (const idx of lastFoundSets[s]) {
+                        const [x1, y1, x2, y2] = lastDetections[idx].box;
+                        dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                    }
+                }
+            }
+
+            async function processFrame() {
+                isProcessing = true;
+
                 let t0 = performance.now();
                 const yIn = preprocessYOLO();
                 const yOut = await yoloSession.run({
@@ -237,63 +282,44 @@
                 });
                 const dets = nms(decodeYOLO(yOut[yoloSession.outputNames[0]]));
                 tSeg = performance.now() - t0;
-                dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+
                 let t1 = performance.now();
                 const cards = [];
+
                 for (const [x1, y1, x2, y2, conf] of dets) {
-                    const w = (x2 - x1) | 0,
-                        h = (y2 - y1) | 0;
+                    const w = x2 - x1,
+                        h = y2 - y1;
                     if (w < 5 || h < 5) continue;
+
                     cropCanvas.width = w;
                     cropCanvas.height = h;
                     cropCtx.drawImage(displayCanvas, x1, y1, w, h, 0, 0, w, h);
+
                     const clfIn = preprocessClassifier(w, h);
                     const out = await clfSession.run({
                         [clfSession.inputNames[0]]: clfIn,
                     });
-                    const attrs = {
-                        color: COLORS[argmax(out.color.data)],
-                        shape: SHAPES[argmax(out.shape.data)],
-                        fill: FILLS[argmax(out.fill.data)],
-                        count: COUNTS[argmax(out.count.data)],
-                    };
-                    cards.push({ box: [x1, y1, x2, y2], attrs });
+
+                    cards.push({
+                        box: [x1, y1, x2, y2],
+                        attrs: {
+                            color: COLORS[argmax(out.color.data)],
+                            shape: SHAPES[argmax(out.shape.data)],
+                            fill: FILLS[argmax(out.fill.data)],
+                            count: COUNTS[argmax(out.count.data)],
+                        },
+                    });
                 }
                 tClf = performance.now() - t1;
 
                 let t2 = performance.now();
-                const found = findSets(cards);
+                const sets = findSets(cards);
                 tSet = performance.now() - t2;
 
-                let showSets = found;
-                const now = performance.now();
-                if (found.length > 0) {
-                    lastSets = found;
-                    lastSetTime = now;
-                } else if (now - lastSetTime < SET_HOLD_MS) {
-                    showSets = lastSets;
-                } else {
-                    showSets = [];
-                }
-
-                const colors = ["#00FF00", "#FFFF00", "#3399FF"];
-                for (const c of cards) {
-                    const [x1, y1, x2, y2] = c.box;
-                    dispCtx.strokeStyle = "lime";
-                    dispCtx.lineWidth = 2;
-                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                }
-                for (let s = 0; s < showSets.length; s++) {
-                    const col = colors[s % colors.length];
-                    dispCtx.strokeStyle = col;
-                    dispCtx.lineWidth = 4;
-                    for (const idx of showSets[s]) {
-                        const [x1, y1, x2, y2] = cards[idx].box;
-                        dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                    }
-                }
-
-                perfBox.textContent = `seg: ${tSeg.toFixed(1)}ms, clf: ${tClf.toFixed(1)}ms, set: ${tSet.toFixed(1)}ms`;
+                // Persist results for holding
+                lastDetections = cards;
+                lastFoundSets = sets;
+                lastUpdateTime = performance.now();
 
                 // Update card list
                 const list = cards
@@ -301,9 +327,10 @@
                         const a = c.attrs;
                         return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
                     })
-                    .join("");
+                    .join("\n");
                 document.getElementById("cardList").textContent = list;
-                requestAnimationFrame(loop);
+
+                isProcessing = false;
             }
 
             async function init() {
