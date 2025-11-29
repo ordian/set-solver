@@ -41,170 +41,260 @@
 
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
         <script type="module">
+            import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js";
+
+            // =================================================
+            // CANVAS AND DOM
+            // =================================================
             const video = document.getElementById("video");
             const captureCanvas = document.getElementById("captureCanvas");
             const displayCanvas = document.getElementById("displayCanvas");
-            const statusEl = document.getElementById("status");
             const capCtx = captureCanvas.getContext("2d");
             const dispCtx = displayCanvas.getContext("2d");
+            const statusEl = document.getElementById("status");
 
-            let yoloSession, cardSession;
-            let confThreshold = 0.5;
+            captureCanvas.width = 640;
+            captureCanvas.height = 480;
+            displayCanvas.width = 640;
+            displayCanvas.height = 480;
 
-            // --- YOLO NMS + decode (Ultralytics ONNX) ---
-            function decodeYOLO(output) {
-                const boxes = [];
-                const data = output.data;
-                const rows = output.dims[2];
-                for (let i = 0; i < rows; i++) {
-                    const idx = i * 6;
-                    const cls = data[idx + 5];
-                    const conf = data[idx + 4];
-                    if (conf < confThreshold) continue;
-                    const x1 = data[idx];
-                    const y1 = data[idx + 1];
-                    const x2 = data[idx + 2];
-                    const y2 = data[idx + 3];
-                    boxes.push([x1, y1, x2, y2, conf, cls]);
-                }
-                return boxes;
-            }
+            // =================================================
+            // CONSTANTS (sync with Python)
+            // =================================================
+            const COLORS = ["red", "green", "purple"];
+            const SHAPES = ["diamond", "oval", "squiggle"];
+            const FILLS = ["solid", "striped", "empty"];
+            const COUNTS = ["one", "two", "three"];
 
-            async function init() {
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: "environment" },
-                });
-                video.srcObject = stream;
+            const YOLO_W = 640;
+            const YOLO_H = 480;
+            const IMG_SIZE = 224;
 
-                yoloSession = await ort.InferenceSession.create("yolo.onnx");
-                cardSession = await ort.InferenceSession.create(
-                    "card_classifier.onnx",
-                );
-                statusEl.textContent = "Models loaded.";
-                loop();
-            }
+            // PERFORMANCE SETTINGS
+            const TARGET_FPS = 4; // Run inference at ~4 FPS
+            let lastFrameTime = 0;
 
+            let yoloSession, clfSession;
+
+            // Preallocate reusable classifier crop canvas
+            const cropCanvas = document.createElement("canvas");
+            cropCanvas.width = 300;
+            cropCanvas.height = 300;
+            const cropCtx = cropCanvas.getContext("2d");
+
+            // =================================================
+            // PREPROCESS YOLO
+            // =================================================
             function preprocessYOLO() {
-                capCtx.drawImage(video, 0, 0, 640, 480);
-                const img = capCtx.getImageData(0, 0, 640, 480);
-                const arr = new Float32Array(1 * 3 * 640 * 480);
-                let o = 0;
-                for (let i = 0; i < img.data.length; i += 4) {
-                    const r = img.data[i] / 255;
-                    const g = img.data[i + 1] / 255;
-                    const b = img.data[i + 2] / 255;
-                    arr[o++] = r;
-                    arr[o++] = g;
-                    arr[o++] = b;
+                capCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+                const img = capCtx.getImageData(0, 0, YOLO_W, YOLO_H);
+
+                const data = new Float32Array(1 * 3 * YOLO_H * YOLO_W);
+
+                const planeSize = YOLO_W * YOLO_H;
+                let rOfs = 0;
+                let gOfs = planeSize;
+                let bOfs = planeSize * 2;
+
+                // Convert HWC to CHW and normalize to 0..1
+                const d = img.data;
+                for (let i = 0, px = 0; i < d.length; i += 4, px++) {
+                    const r = d[i] / 255;
+                    const g = d[i + 1] / 255;
+                    const b = d[i + 2] / 255;
+
+                    data[rOfs++] = r;
+                    data[gOfs++] = g;
+                    data[bOfs++] = b;
                 }
-                return new ort.Tensor("float32", arr, [1, 3, 480, 640]);
+                return new ort.Tensor("float32", data, [1, 3, YOLO_H, YOLO_W]);
             }
 
-            // --- classifier ---
-            async function classifyCard(crop) {
-                const can = document.createElement("canvas");
-                can.width = 224;
-                can.height = 224;
-                const ctx = can.getContext("2d");
-                ctx.drawImage(crop, 0, 0, 224, 224);
+            // =================================================
+            // CLASSIFIER preprocess
+            // =================================================
+            const mean = [0.485, 0.456, 0.406];
+            const std = [0.229, 0.224, 0.225];
 
-                const img = ctx.getImageData(0, 0, 224, 224);
-                const arr = new Float32Array(1 * 3 * 224 * 224);
-                let o = 0;
-                for (let i = 0; i < img.data.length; i += 4) {
-                    const r = img.data[i] / 255;
-                    const g = img.data[i + 1] / 255;
-                    const b = img.data[i + 2] / 255;
-                    arr[o++] = (r - 0.485) / 0.229;
-                    arr[o++] = (g - 0.456) / 0.224;
-                    arr[o++] = (b - 0.406) / 0.225;
+            function preprocessClassifier(cropW, cropH) {
+                // Resize card crop into 224x224
+                const rctx = cropCanvas.getContext("2d");
+                const resized = document.createElement("canvas");
+                resized.width = IMG_SIZE;
+                resized.height = IMG_SIZE;
+
+                const r2 = resized.getContext("2d");
+                r2.drawImage(
+                    cropCanvas,
+                    0,
+                    0,
+                    cropW,
+                    cropH,
+                    0,
+                    0,
+                    IMG_SIZE,
+                    IMG_SIZE,
+                );
+
+                // Extract, normalize (ImageNet), CHW
+                const img = r2.getImageData(0, 0, IMG_SIZE, IMG_SIZE);
+                const data = new Float32Array(1 * 3 * IMG_SIZE * IMG_SIZE);
+
+                const plane = IMG_SIZE * IMG_SIZE;
+                let rOfs = 0;
+                let gOfs = plane;
+                let bOfs = plane * 2;
+
+                const d = img.data;
+                for (let i = 0, px = 0; i < d.length; i += 4, px++) {
+                    let r = (d[i] / 255 - mean[0]) / std[0];
+                    let g = (d[i + 1] / 255 - mean[1]) / std[1];
+                    let b = (d[i + 2] / 255 - mean[2]) / std[2];
+
+                    data[rOfs++] = r;
+                    data[gOfs++] = g;
+                    data[bOfs++] = b;
                 }
-                const input = new ort.Tensor("float32", arr, [1, 3, 224, 224]);
-                const out = await cardSession.run({ image: input });
+                return new ort.Tensor("float32", data, [
+                    1,
+                    3,
+                    IMG_SIZE,
+                    IMG_SIZE,
+                ]);
+            }
 
-                function argmax(t) {
-                    let m = 0,
-                        mi = 0;
-                    for (let i = 0; i < t.data.length; i++) {
-                        if (t.data[i] > m || i === 0) {
-                            m = t.data[i];
-                            mi = i;
-                        }
+            // =================================================
+            // Parse YOLO output (1,300,6)
+            // =================================================
+            function parseDetections(out, confThresh = 0.25) {
+                let det = out[0][0]; // (300,6)
+                const result = [];
+                for (let i = 0; i < det.length; i++) {
+                    if (det[i][4] > confThresh) result.push(det[i]);
+                }
+                return result;
+            }
+
+            // =================================================
+            // Argmax utility
+            // =================================================
+            function argmax(arr) {
+                let max = arr[0];
+                let idx = 0;
+                for (let i = 1; i < arr.length; i++) {
+                    if (arr[i] > max) {
+                        max = arr[i];
+                        idx = i;
                     }
-                    return mi;
                 }
-
-                return {
-                    color: argmax(out.color),
-                    shape: argmax(out.shape),
-                    fill: argmax(out.fill),
-                    count: argmax(out.count),
-                };
+                return idx;
             }
 
+            // =================================================
+            // SET detection logic
+            // =================================================
             function isSet(a, b, c) {
-                const attrs = ["color", "shape", "fill", "count"];
-                for (const x of attrs) {
-                    const v = [a[x], b[x], c[x]];
-                    const same = v[0] === v[1] && v[1] === v[2];
-                    const diff = new Set(v).size === 3;
-                    if (!(same || diff)) return false;
-                }
-                return true;
+                // a, b, c: { color, shape, fill, count }
+                return (
+                    attrOK(a.color, b.color, c.color) &&
+                    attrOK(a.shape, b.shape, c.shape) &&
+                    attrOK(a.fill, b.fill, c.fill) &&
+                    attrOK(a.count, b.count, c.count)
+                );
+            }
+            function attrOK(x, y, z) {
+                return (x === y && y === z) || (x !== y && x !== z && y !== z);
             }
 
-            async function loop() {
-                const input = preprocessYOLO();
-                let boxes = [];
-
-                try {
-                    const yout = await yoloSession.run({ images: input });
-                    const raw = yout[Object.keys(yout)[0]];
-                    boxes = decodeYOLO(raw);
-                } catch (e) {}
-
-                dispCtx.drawImage(video, 0, 0, 640, 480);
-
-                const cards = [];
-                for (const b of boxes) {
-                    const [x1, y1, x2, y2] = b;
-                    const w = x2 - x1;
-                    const h = y2 - y1;
-                    const c = document.createElement("canvas");
-                    c.width = w;
-                    c.height = h;
-                    c.getContext("2d").drawImage(
-                        displayCanvas,
-                        x1,
-                        y1,
-                        w,
-                        h,
-                        0,
-                        0,
-                        w,
-                        h,
-                    );
-                    const attrs = await classifyCard(c);
-                    cards.push({ box: [x1, y1, x2, y2], attrs });
-
-                    dispCtx.strokeStyle = "yellow";
-                    dispCtx.lineWidth = 2;
-                    dispCtx.strokeRect(x1, y1, w, h);
-                }
-
+            function findSets(cards) {
                 const sets = [];
-                for (let i = 0; i < cards.length; i++)
-                    for (let j = i + 1; j < cards.length; j++)
-                        for (let k = j + 1; k < cards.length; k++)
+                for (let i = 0; i < cards.length; i++) {
+                    for (let j = i + 1; j < cards.length; j++) {
+                        for (let k = j + 1; k < cards.length; k++) {
                             if (
                                 isSet(
                                     cards[i].attrs,
                                     cards[j].attrs,
                                     cards[k].attrs,
                                 )
-                            )
+                            ) {
                                 sets.push([i, j, k]);
+                            }
+                        }
+                    }
+                }
+                return sets;
+            }
 
+            // =================================================
+            // MAIN LOOP
+            // =================================================
+            async function loop(time) {
+                // FPS throttling
+                if (time - lastFrameTime < 1000 / TARGET_FPS) {
+                    requestAnimationFrame(loop);
+                    return;
+                }
+                lastFrameTime = time;
+
+                const yoloInput = preprocessYOLO();
+                const yoloOut = await yoloSession.run({
+                    [yoloSession.inputNames[0]]: yoloInput,
+                });
+                const dets = parseDetections(yoloOut);
+
+                dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+
+                const cards = [];
+
+                for (let d = 0; d < dets.length; d++) {
+                    const [x1, y1, x2, y2] = dets[d];
+
+                    const w = (x2 - x1) | 0;
+                    const h = (y2 - y1) | 0;
+
+                    if (w < 5 || h < 5) continue; // Reject tiny boxes
+
+                    // Reuse a single crop canvas → MAJOR perf gain
+                    cropCanvas.width = w;
+                    cropCanvas.height = h;
+                    cropCtx.drawImage(displayCanvas, x1, y1, w, h, 0, 0, w, h);
+
+                    // Classifier
+                    const clfInput = preprocessClassifier(w, h);
+                    const out = await clfSession.run({
+                        [clfSession.inputNames[0]]: clfInput,
+                    });
+
+                    const color = COLORS[argmax(out.color.data)];
+                    const shape = SHAPES[argmax(out.shape.data)];
+                    const fill = FILLS[argmax(out.fill.data)];
+                    const count = COUNTS[argmax(out.count.data)];
+
+                    // Store for set-detection
+                    cards.push({
+                        box: [x1, y1, x2, y2],
+                        attrs: { color, shape, fill, count },
+                    });
+
+                    // Console logging only
+                    console.log(`Card ${d}:`, cards[cards.length - 1].attrs);
+                }
+
+                // =================================================
+                // FIND SETS
+                // =================================================
+                const sets = findSets(cards);
+
+                // Draw all detection boxes (green)
+                dispCtx.lineWidth = 2;
+                for (let i = 0; i < cards.length; i++) {
+                    const [x1, y1, x2, y2] = cards[i].box;
+                    dispCtx.strokeStyle = "lime";
+                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                }
+
+                // Highlight SETS (red)
                 for (const trip of sets) {
                     for (const idx of trip) {
                         const [x1, y1, x2, y2] = cards[idx].box;
@@ -217,6 +307,27 @@
                 requestAnimationFrame(loop);
             }
 
+            // =================================================
+            // INITIALIZATION
+            // =================================================
+            async function init() {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: "environment",
+                        width: 640,
+                        height: 480,
+                    },
+                });
+                video.srcObject = stream;
+
+                yoloSession = await ort.InferenceSession.create("yolo.onnx");
+                clfSession = await ort.InferenceSession.create(
+                    "card_classifier.onnx",
+                );
+
+                statusEl.textContent = "Models loaded.";
+                requestAnimationFrame(loop);
+            }
             init();
         </script>
         <!-- Updated script inserted below -->

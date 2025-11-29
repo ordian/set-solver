@@ -605,7 +605,7 @@ def train_detector(epochs: int = 50):
         data=str(data_yaml),
         epochs=epochs,
         batch=4,
-        imgsz=640,
+        imgsz=(480, 640),
         device="0" if torch.cuda.is_available() else "cpu",
         project="runs",
         name="card_detector",
@@ -728,6 +728,130 @@ def test(image_path: str):
     print(f"\nAnnotated image saved: {output_path}")
 
 
+def test_onnx(image_path: str):
+    """Test full detection + classification pipeline using ONNX models."""
+    from pathlib import Path
+
+    import numpy as np
+    import onnxruntime as ort
+    from PIL import Image, ImageDraw
+
+    # ----------------------------
+    # Load ONNX models
+    # ----------------------------
+    yolo_sess = ort.InferenceSession(
+        "runs/card_detector/weights/best.onnx", providers=["CPUExecutionProvider"]
+    )
+    clf_sess = ort.InferenceSession(
+        "runs/card_classifier_single.onnx", providers=["CPUExecutionProvider"]
+    )
+    print("Outputs:", yolo_sess.get_outputs())
+
+    # ----------------------------
+    # Utility: preprocess for YOLO
+    # Must match your 640x640 or 640x480 export size
+    # ----------------------------
+    YOLO_W, YOLO_H = 640, 480  # adjust if your detector export shape is different
+
+    def preprocess_yolo(img):
+        """Resize + normalize to shape (1,3,H,W)."""
+        img_resized = img.resize((YOLO_W, YOLO_H))
+        arr = np.array(img_resized).astype(np.float32) / 255.0
+        arr = arr.transpose(2, 0, 1)  # HWC → CHW
+        arr = np.expand_dims(arr, axis=0)
+        return arr
+
+    # ----------------------------
+    # Utility: preprocess crops for classifier
+    # ----------------------------
+    IMG_SIZE = 224
+
+    def preprocess_classifier(crop):
+        crop = crop.resize((IMG_SIZE, IMG_SIZE))
+        arr = np.array(crop).astype(np.float32) / 255.0
+
+        # Normalize using ImageNet mean/std
+        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        arr = (arr - mean) / std
+
+        arr = arr.transpose(2, 0, 1)  # CHW
+        arr = np.expand_dims(arr, axis=0)
+        return arr
+
+    # ----------------------------
+    # Inference: YOLO detector
+    # ----------------------------
+    img = Image.open(image_path).convert("RGB")
+    yolo_inp = preprocess_yolo(img)
+
+    # YOLO ONNX input name depends on model
+    yolo_input_name = yolo_sess.get_inputs()[0].name
+    yolo_out = yolo_sess.run(None, {yolo_input_name: yolo_inp})
+
+    # Ultralytics ONNX typically returns a single Nx6 matrix: [x1,y1,x2,y2,conf,class]
+    def parse_yolo11_onnx_output(out, conf_threshold=0.25):
+        arr = np.array(out[0])  # (1,300,6)
+        arr = arr[0]  # (300,6)
+
+        # Filter out invalid rows: YOLO pads empty detections with zeros
+        valid = arr[:, 4] > conf_threshold
+        arr = arr[valid]
+
+        return arr
+
+    det_out = parse_yolo11_onnx_output(yolo_out)
+    print("Detections:", det_out.shape)
+    boxes = det_out
+
+    print(f"\nDetected {len(boxes)} cards:")
+
+    draw = ImageDraw.Draw(img)
+    color_map = {"red": "#FF4444", "green": "#44FF44", "purple": "#AA44FF"}
+
+    # Replace with your mapping lists
+
+    for i, (x1, y1, x2, y2, conf, cls) in enumerate(boxes):
+        x1, y1, x2, y2 = map(int, (x1, y1, x2, y2))
+        crop = img.crop((x1, y1, x2, y2))
+
+        # ----------------------------
+        # Classifier inference
+        # ----------------------------
+        inp = preprocess_classifier(crop)
+        inp_name = clf_sess.get_inputs()[0].name
+
+        # Run classifier ONNX
+        out_color, out_shape, out_fill, out_count = clf_sess.run(None, {inp_name: inp})
+
+        # Argmax each head
+        color_idx = int(np.argmax(out_color))
+        shape_idx = int(np.argmax(out_shape))
+        fill_idx = int(np.argmax(out_fill))
+        count_idx = int(np.argmax(out_count)) + 1  # counts 1..3
+
+        color = COLORS[color_idx]
+        shape = SHAPES[shape_idx]
+        fill = FILLS[fill_idx]
+
+        box_color = color_map.get(color, "#FFFFFF")
+        draw.rectangle([x1, y1, x2, y2], outline=box_color, width=3)
+
+        label = f"{i + 1}"
+        bbox = draw.textbbox((x1, y1), label)
+        draw.rectangle(
+            [x1, y1 - (bbox[3] - bbox[1]) - 6, x1 + (bbox[2] - bbox[0]) + 6, y1],
+            fill=box_color,
+        )
+        draw.text((x1 + 3, y1 - (bbox[3] - bbox[1]) - 3), label, fill="black")
+
+        print(f"  Card {i + 1}: {count_idx} {color} {shape} {fill}")
+
+    output_path = Path(image_path).stem + "_onnx_annotated.jpg"
+    img.save(output_path)
+    print(f"\nAnnotated image saved: {output_path}")
+
+
 # ============================================
 # Export
 # ============================================
@@ -738,7 +862,13 @@ def export():
     detector_path = "runs/card_detector/weights/best.pt"
     if Path(detector_path).exists():
         model = YOLO(detector_path)
-        model.export(format="onnx", imgsz=640, simplify=True, opset=18)
+        model.export(
+            format="onnx",
+            imgsz=(480, 640),
+            opset=18,
+            nms=True,
+            dynamic=False,
+        )
         print(f"Detector exported")
 
     classifier_path = "runs/card_classifier.pt"
@@ -757,7 +887,25 @@ def export():
             input_names=["image"],
             output_names=["color", "shape", "fill", "count"],
             opset_version=18,
+            export_params=True,
+            # do_constant_folding=True,
         )
+        import onnx
+        from onnx import numpy_helper
+
+        model = onnx.load("runs/card_classifier.onnx", load_external_data=True)
+
+        # Force all initializers to embed raw data
+        for init in model.graph.initializer:
+            if init.data_location == onnx.TensorProto.EXTERNAL:
+                # Load the external data into raw_data
+                array = numpy_helper.to_array(init)
+                init.ClearField("external_data")
+                init.data_location = onnx.TensorProto.DEFAULT
+                init.raw_data = array.tobytes()
+
+        onnx.save(model, "runs/card_classifier_single.onnx")
+
         print(f"Classifier exported: runs/card_classifier.onnx")
 
 
@@ -790,6 +938,6 @@ if __name__ == "__main__":
         if len(sys.argv) < 3:
             print("Usage: uv run train_simple.py test <image.jpg>")
         else:
-            test(sys.argv[2])
+            test_onnx(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")
