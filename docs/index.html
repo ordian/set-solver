@@ -1,6 +1,8 @@
 <!doctype html>
 <html lang="en">
     <head>
+        <link rel="manifest" href="manifest.json" />
+        <meta name="theme-color" content="#f5ebdc" />
         <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Set Game Detector</title>
@@ -48,6 +50,15 @@
             ></canvas>
             <canvas id="displayCanvas" width="640" height="480"></canvas>
             <div id="status">Loading models...</div>
+            <div
+                id="cardList"
+                style="
+                    white-space: pre;
+                    margin-top: 1rem;
+                    font-family: monospace;
+                    font-size: 14px;
+                "
+            ></div>
             <div id="perfBox">seg: -, clf: -, set: -</div>
         </div>
 
@@ -283,6 +294,15 @@
                 }
 
                 perfBox.textContent = `seg: ${tSeg.toFixed(1)}ms, clf: ${tClf.toFixed(1)}ms, set: ${tSet.toFixed(1)}ms`;
+
+                // Update card list
+                const list = cards
+                    .map((c, i) => {
+                        const a = c.attrs;
+                        return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
+                    })
+                    .join("");
+                document.getElementById("cardList").textContent = list;
                 requestAnimationFrame(loop);
             }
 
@@ -303,10 +323,21 @@
                     "classification.onnx",
                     { executionProviders: ["webgpu"] },
                 );
+
                 statusEl.textContent = "Models loaded.";
+
                 requestAnimationFrame(loop);
             }
             init();
+        </script>
+        <script>
+            if ("serviceWorker" in navigator) {
+                navigator.serviceWorker
+                    .register("service-worker.js")
+                    .catch((err) =>
+                        console.error("SW registration failed", err),
+                    );
+            }
         </script>
     </body>
 </html>
