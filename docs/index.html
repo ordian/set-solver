@@ -322,9 +322,10 @@
                 });
                 video.srcObject = stream;
 
-                yoloSession = await ort.InferenceSession.create("yolo.onnx");
+                yoloSession =
+                    await ort.InferenceSession.create("segmentation.onnx");
                 clfSession = await ort.InferenceSession.create(
-                    "card_classifier.onnx",
+                    "classification.onnx",
                 );
 
                 statusEl.textContent = "Models loaded.";

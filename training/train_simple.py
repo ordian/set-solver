@@ -740,12 +740,12 @@ def test_onnx(image_path: str):
     # Load ONNX models
     # ----------------------------
     yolo_sess = ort.InferenceSession(
-        "runs/card_detector/weights/best.onnx", providers=["CPUExecutionProvider"]
+        "../docs/segmentation.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "runs/card_classifier_single.onnx", providers=["CPUExecutionProvider"]
+        "../docs/classification.onnx", providers=["CPUExecutionProvider"]
     )
-    print("Outputs:", yolo_sess.get_outputs())
+    print("Inputs: ", yolo_sess.get_inputs()[0].shape)
 
     # ----------------------------
     # Utility: preprocess for YOLO
