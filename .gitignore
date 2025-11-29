@@ -1,0 +1,6 @@
+training/dataset/
+training/runs/
+**/*.jpg
+**/*.pt
+
+.DS_Store

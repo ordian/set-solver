@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Set Game Detector</title>
+        <style>
+            body {
+                font-family: sans-serif;
+                margin: 0;
+                padding: 0;
+            }
+            #container {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                padding: 1rem;
+            }
+            video,
+            canvas {
+                max-width: 100%;
+            }
+            #status {
+                margin-top: 1rem;
+            }
+        </style>
+    </head>
+    <body>
+        <div id="container">
+            <h2>Set Game Detection</h2>
+            <video id="video" autoplay playsinline></video>
+            <canvas
+                id="captureCanvas"
+                width="640"
+                height="480"
+                style="display: none"
+            ></canvas>
+            <canvas id="displayCanvas" width="640" height="480"></canvas>
+            <div id="status">Loading models...</div>
+        </div>
+
+        <script type="module">
+            // UI + YOLO decoding + classifier corrections
+            import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js";
+
+            const video = document.getElementById("video");
+            const captureCanvas = document.getElementById("captureCanvas");
+            const displayCanvas = document.getElementById("displayCanvas");
+            const statusEl = document.getElementById("status");
+            const capCtx = captureCanvas.getContext("2d");
+            const dispCtx = displayCanvas.getContext("2d");
+
+            let yoloSession, cardSession;
+            let confThreshold = 0.5;
+
+            // --- YOLO NMS + decode (Ultralytics ONNX) ---
+            function decodeYOLO(output) {
+                const boxes = [];
+                const data = output.data;
+                const rows = output.dims[2];
+                for (let i = 0; i < rows; i++) {
+                    const idx = i * 6;
+                    const cls = data[idx + 5];
+                    const conf = data[idx + 4];
+                    if (conf < confThreshold) continue;
+                    const x1 = data[idx];
+                    const y1 = data[idx + 1];
+                    const x2 = data[idx + 2];
+                    const y2 = data[idx + 3];
+                    boxes.push([x1, y1, x2, y2, conf, cls]);
+                }
+                return boxes;
+            }
+
+            async function init() {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: "environment" },
+                });
+                video.srcObject = stream;
+
+                yoloSession = await ort.InferenceSession.create("yolo.onnx");
+                cardSession = await ort.InferenceSession.create(
+                    "card_classifier.onnx",
+                );
+                statusEl.textContent = "Models loaded.";
+                loop();
+            }
+
+            function preprocessYOLO() {
+                capCtx.drawImage(video, 0, 0, 640, 480);
+                const img = capCtx.getImageData(0, 0, 640, 480);
+                const arr = new Float32Array(1 * 3 * 640 * 480);
+                let o = 0;
+                for (let i = 0; i < img.data.length; i += 4) {
+                    const r = img.data[i] / 255;
+                    const g = img.data[i + 1] / 255;
+                    const b = img.data[i + 2] / 255;
+                    arr[o++] = r;
+                    arr[o++] = g;
+                    arr[o++] = b;
+                }
+                return new ort.Tensor("float32", arr, [1, 3, 480, 640]);
+            }
+
+            // --- classifier ---
+            async function classifyCard(crop) {
+                const can = document.createElement("canvas");
+                can.width = 224;
+                can.height = 224;
+                const ctx = can.getContext("2d");
+                ctx.drawImage(crop, 0, 0, 224, 224);
+
+                const img = ctx.getImageData(0, 0, 224, 224);
+                const arr = new Float32Array(1 * 3 * 224 * 224);
+                let o = 0;
+                for (let i = 0; i < img.data.length; i += 4) {
+                    const r = img.data[i] / 255;
+                    const g = img.data[i + 1] / 255;
+                    const b = img.data[i + 2] / 255;
+                    arr[o++] = (r - 0.485) / 0.229;
+                    arr[o++] = (g - 0.456) / 0.224;
+                    arr[o++] = (b - 0.406) / 0.225;
+                }
+                const input = new ort.Tensor("float32", arr, [1, 3, 224, 224]);
+                const out = await cardSession.run({ image: input });
+
+                function argmax(t) {
+                    let m = 0,
+                        mi = 0;
+                    for (let i = 0; i < t.data.length; i++) {
+                        if (t.data[i] > m || i === 0) {
+                            m = t.data[i];
+                            mi = i;
+                        }
+                    }
+                    return mi;
+                }
+
+                return {
+                    color: argmax(out.color),
+                    shape: argmax(out.shape),
+                    fill: argmax(out.fill),
+                    count: argmax(out.count),
+                };
+            }
+
+            function isSet(a, b, c) {
+                const attrs = ["color", "shape", "fill", "count"];
+                for (const x of attrs) {
+                    const v = [a[x], b[x], c[x]];
+                    const same = v[0] === v[1] && v[1] === v[2];
+                    const diff = new Set(v).size === 3;
+                    if (!(same || diff)) return false;
+                }
+                return true;
+            }
+
+            async function loop() {
+                const input = preprocessYOLO();
+                let boxes = [];
+
+                try {
+                    const yout = await yoloSession.run({ images: input });
+                    const raw = yout[Object.keys(yout)[0]];
+                    boxes = decodeYOLO(raw);
+                } catch (e) {}
+
+                dispCtx.drawImage(video, 0, 0, 640, 480);
+
+                const cards = [];
+                for (const b of boxes) {
+                    const [x1, y1, x2, y2] = b;
+                    const w = x2 - x1;
+                    const h = y2 - y1;
+                    const c = document.createElement("canvas");
+                    c.width = w;
+                    c.height = h;
+                    c.getContext("2d").drawImage(
+                        displayCanvas,
+                        x1,
+                        y1,
+                        w,
+                        h,
+                        0,
+                        0,
+                        w,
+                        h,
+                    );
+                    const attrs = await classifyCard(c);
+                    cards.push({ box: [x1, y1, x2, y2], attrs });
+
+                    dispCtx.strokeStyle = "yellow";
+                    dispCtx.lineWidth = 2;
+                    dispCtx.strokeRect(x1, y1, w, h);
+                }
+
+                const sets = [];
+                for (let i = 0; i < cards.length; i++)
+                    for (let j = i + 1; j < cards.length; j++)
+                        for (let k = j + 1; k < cards.length; k++)
+                            if (
+                                isSet(
+                                    cards[i].attrs,
+                                    cards[j].attrs,
+                                    cards[k].attrs,
+                                )
+                            )
+                                sets.push([i, j, k]);
+
+                for (const trip of sets) {
+                    for (const idx of trip) {
+                        const [x1, y1, x2, y2] = cards[idx].box;
+                        dispCtx.strokeStyle = "red";
+                        dispCtx.lineWidth = 4;
+                        dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                    }
+                }
+
+                requestAnimationFrame(loop);
+            }
+
+            init();
+        </script>
+        <!-- Updated script inserted below -->
+    </body>
+</html>
