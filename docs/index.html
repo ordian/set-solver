@@ -84,16 +84,16 @@
             // PREPROCESS YOLO
             // =================================================
             function preprocessYOLO() {
-                // data shape = [1, 3, YOLO_H, YOLO_W]
-                const data = new Float32Array(1 * 3 * YOLO_H * YOLO_W);
-
-                let rOfs = 0;
-                let gOfs = YOLO_W * YOLO_H;
-                let bOfs = YOLO_W * YOLO_H * 2;
-
                 capCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
                 const img = capCtx.getImageData(0, 0, YOLO_W, YOLO_H);
                 const d = img.data;
+
+                const data = new Float32Array(1 * 3 * YOLO_H * YOLO_W);
+
+                const plane = YOLO_W * YOLO_H;
+                let rOfs = 0;
+                let gOfs = plane;
+                let bOfs = plane * 2;
 
                 let px = 0;
                 for (let y = 0; y < YOLO_H; y++) {
