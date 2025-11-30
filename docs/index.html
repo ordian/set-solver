@@ -374,6 +374,9 @@
 
                 const img = new Image();
                 img.onload = () => {
+                    // hard-stop video immediately
+                    isProcessing = false; // cancel any pending processing
+                    capturedImage = null;
                     ctx.drawImage(img, 0, 0, YOLO_W, YOLO_H);
 
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
@@ -407,13 +410,19 @@
                 const t1 = performance.now();
 
                 for (const [x1, y1, x2, y2, conf] of dets) {
-                    const w = x2 - x1,
-                        h = y2 - y1;
+                    const x1c = Math.max(0, Math.min(YOLO_W - 1, x1));
+                    const y1c = Math.max(0, Math.min(YOLO_H - 1, y1));
+                    const x2c = Math.max(0, Math.min(YOLO_W - 1, x2));
+                    const y2c = Math.max(0, Math.min(YOLO_H - 1, y2));
+
+                    const w = x2c - x1c;
+                    const h = y2c - y1c;
                     if (w < 5 || h < 5) continue;
 
                     cropCanvas.width = w;
                     cropCanvas.height = h;
-                    cropCtx.putImageData(imageData, -x1, -y1);
+                    cropCtx.drawImage(canvas, x1c, y1c, w, h, 0, 0, w, h);
+                    // cropCtx.putImageData(imageData, -x1, -y1);
 
                     const clfIn = preprocessClassifier(w, h);
                     const out = await clfSession.run({
