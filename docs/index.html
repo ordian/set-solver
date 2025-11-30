@@ -362,27 +362,22 @@
             // Manual Upload
             // =================================================
             uploadBtn.onchange = async (e) => {
-                const input = /** @type {HTMLInputElement} */ (e.currentTarget);
-                const file = input.files && input.files[0];
+                const file = this.files && this.files[0];
                 if (!file) {
                     return;
                 }
 
+                // Stop the loop BEFORE drawing, or video will overwrite the canvas
+                paused = true;
+                video.style.display = "none";
+                canvas.style.display = "block";
+
                 const img = new Image();
                 img.onload = () => {
-                    // Stop the loop BEFORE drawing, or video will overwrite the canvas
-                    paused = true;
-
-                    video.style.display = "none";
-                    canvas.style.display = "block";
-
-                    // Draw uploaded image
                     ctx.drawImage(img, 0, 0, YOLO_W, YOLO_H);
 
-                    // Now capture image data
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
 
-                    // Process the image
                     processFrame(capturedImage);
                 };
 
@@ -501,9 +496,9 @@
                     const a = c.attrs;
                     return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
                 });
-                const setLines = lastSets.map((s, i) => {
-                    `Set ${i + 1}: ${s.map((x) => x + 1).join(", ")}`;
-                });
+                const setLines = lastSets.map(
+                    (s, i) => `Set ${i + 1}: ${s.map((x) => x + 1).join(", ")}`,
+                );
 
                 document.getElementById("cardList").textContent = [
                     ...cardLines,
