@@ -36,12 +36,20 @@
                 font-size: 14px;
                 pointer-events: none;
             }
+            #nextBtn {
+                margin-top: 1rem;
+                padding: 8px 16px;
+                font-size: 15px;
+                display: none;
+            }
         </style>
     </head>
     <body>
         <div id="container">
             <h2>Set Game Detection</h2>
+
             <video id="video" autoplay playsinline></video>
+
             <canvas
                 id="captureCanvas"
                 width="640"
@@ -49,7 +57,11 @@
                 style="display: none"
             ></canvas>
             <canvas id="displayCanvas" width="640" height="480"></canvas>
+
+            <button id="nextBtn">Next</button>
+
             <div id="status">Loading models...</div>
+
             <div
                 id="cardList"
                 style="
@@ -59,6 +71,7 @@
                     font-size: 14px;
                 "
             ></div>
+
             <div id="perfBox">seg: -, clf: -, set: -</div>
         </div>
 
@@ -67,33 +80,32 @@
             let tSeg = 0,
                 tClf = 0,
                 tSet = 0;
-            let lastDetections = []; // boxes + attrs
-            let lastFoundSets = [];
-            let lastUpdateTime = 0;
-            const HOLD_MS = 2500; // keep UI for 2.5s
-            let isProcessing = false; // avoid double-executing classifier
+            let lastDetections = [];
+            let lastFoundSet = null;
+            let isProcessing = false;
+            let pausedForResult = false;
 
             const COLORS = ["red", "green", "purple"];
             const SHAPES = ["diamond", "oval", "squiggle"];
             const FILLS = ["solid", "striped", "empty"];
             const COUNTS = ["one", "two", "three"];
+
             const YOLO_W = 640,
                 YOLO_H = 480,
                 IMG_SIZE = 224;
             const CONF_THRESH = 0.6,
-                IOU_THRESH = 0.3,
-                TARGET_FPS = 4;
-            let lastFrameTime = 0;
+                IOU_THRESH = 0.3;
 
             const video = document.getElementById("video");
             const captureCanvas = document.getElementById("captureCanvas");
             const displayCanvas = document.getElementById("displayCanvas");
-            const statusEl = document.getElementById("status");
-            const perfBox = document.getElementById("perfBox");
             const capCtx = captureCanvas.getContext("2d");
             const dispCtx = displayCanvas.getContext("2d");
+            const perfBox = document.getElementById("perfBox");
+            const nextBtn = document.getElementById("nextBtn");
 
             let yoloSession, clfSession;
+
             const cropCanvas = document.createElement("canvas");
             const cropCtx = cropCanvas.getContext("2d");
 
@@ -102,9 +114,11 @@
                 const img = capCtx.getImageData(0, 0, YOLO_W, YOLO_H);
                 const d = img.data;
                 const out = new Float32Array(3 * YOLO_W * YOLO_H);
+
                 let r = 0,
                     g = YOLO_W * YOLO_H,
                     b = 2 * YOLO_W * YOLO_H;
+
                 for (let i = 0; i < d.length; i += 4) {
                     out[r++] = d[i] / 255;
                     out[g++] = d[i + 1] / 255;
@@ -131,11 +145,14 @@
                     IMG_SIZE,
                     IMG_SIZE,
                 );
+
                 const img = tctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE).data;
                 const out = new Float32Array(3 * IMG_SIZE * IMG_SIZE);
+
                 let r = 0,
                     g = IMG_SIZE * IMG_SIZE,
                     b = 2 * IMG_SIZE * IMG_SIZE;
+
                 for (let i = 0; i < img.length; i += 4) {
                     out[r++] = (img[i] / 255 - mean[0]) / std[0];
                     out[g++] = (img[i + 1] / 255 - mean[1]) / std[1];
@@ -152,18 +169,21 @@
             function decodeYOLO(raw) {
                 const arr = raw.data;
                 const stride = 6300;
-                const cx = arr.subarray(0, stride),
-                    cy = arr.subarray(stride, 2 * stride),
-                    w = arr.subarray(2 * stride, 3 * stride),
-                    h = arr.subarray(3 * stride, 4 * stride),
-                    conf = arr.subarray(4 * stride, 5 * stride);
+                const cx = arr.subarray(0, stride);
+                const cy = arr.subarray(stride, 2 * stride);
+                const w = arr.subarray(2 * stride, 3 * stride);
+                const h = arr.subarray(3 * stride, 4 * stride);
+                const conf = arr.subarray(4 * stride, 5 * stride);
+
                 const out = [];
                 for (let i = 0; i < stride; i++) {
                     if (conf[i] < CONF_THRESH) continue;
-                    const x1 = cx[i] - w[i] / 2,
-                        y1 = cy[i] - h[i] / 2,
-                        x2 = cx[i] + w[i] / 2,
-                        y2 = cy[i] + h[i] / 2;
+
+                    const x1 = cx[i] - w[i] / 2;
+                    const y1 = cy[i] - h[i] / 2;
+                    const x2 = cx[i] + w[i] / 2;
+                    const y2 = cy[i] + h[i] / 2;
+
                     if (x2 <= x1 || y2 <= y1) continue;
                     out.push([x1, y1, x2, y2, conf[i]]);
                 }
@@ -171,21 +191,24 @@
             }
 
             function iou(a, b) {
-                const x1 = Math.max(a[0], b[0]),
-                    y1 = Math.max(a[1], b[1]),
-                    x2 = Math.min(a[2], b[2]),
-                    y2 = Math.min(a[3], b[3]);
-                const w = Math.max(0, x2 - x1),
-                    h = Math.max(0, y2 - y1);
+                const x1 = Math.max(a[0], b[0]);
+                const y1 = Math.max(a[1], b[1]);
+                const x2 = Math.min(a[2], b[2]);
+                const y2 = Math.min(a[3], b[3]);
+                const w = Math.max(0, x2 - x1);
+                const h = Math.max(0, y2 - y1);
                 const inter = w * h;
                 if (!inter) return 0;
-                const areaA = (a[2] - a[0]) * (a[3] - a[1]),
-                    areaB = (b[2] - b[0]) * (b[3] - b[1]);
+
+                const areaA = (a[2] - a[0]) * (a[3] - a[1]);
+                const areaB = (b[2] - b[0]) * (b[3] - b[1]);
                 return inter / (areaA + areaB - inter);
             }
+
             function nms(boxes) {
                 boxes.sort((a, b) => b[4] - a[4]);
                 const keep = [];
+
                 while (boxes.length) {
                     const a = boxes.shift();
                     keep.push(a);
@@ -193,17 +216,19 @@
                 }
                 return keep;
             }
-            function argmax(t) {
-                let m = t[0],
-                    idx = 0;
-                for (let i = 1; i < t.length; i++)
-                    if (t[i] > m) (m = t[i]), (idx = i);
-                return idx;
+
+            function argmax(arr) {
+                let maxI = 0;
+                for (let i = 1; i < arr.length; i++) {
+                    if (arr[i] > arr[maxI]) maxI = i;
+                }
+                return maxI;
             }
 
-            function attrOK(x, y, z) {
-                return (x === y && y === z) || (x !== y && x !== z && y !== z);
+            function attrOK(a, b, c) {
+                return (a === b && b === c) || (a !== b && a !== c && b !== c);
             }
+
             function isSet(a, b, c) {
                 return (
                     attrOK(a.color, b.color, c.color) &&
@@ -212,6 +237,7 @@
                     attrOK(a.count, b.count, c.count)
                 );
             }
+
             function findSets(cards) {
                 const out = [];
                 for (let i = 0; i < cards.length; i++)
@@ -228,63 +254,32 @@
                 return out;
             }
 
-            async function loop(t) {
+            async function loop() {
                 requestAnimationFrame(loop);
 
-                // Always draw the latest stable frame
+                if (pausedForResult) return;
+
                 dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
 
-                drawPersistentResults();
-
-                // If running classifier — do nothing
-                if (isProcessing) return;
-
-                // Enforce FPS limit
-                if (t - lastFrameTime < 1000 / TARGET_FPS) return;
-                lastFrameTime = t;
-
-                // Start async processing (doesn't block rendering)
-                processFrame();
-            }
-
-            function drawPersistentResults() {
-                const now = performance.now();
-                if (now - lastUpdateTime > HOLD_MS) return;
-
-                // Draw boxes
-                for (const c of lastDetections) {
-                    const [x1, y1, x2, y2] = c.box;
-                    dispCtx.strokeStyle = "lime";
-                    dispCtx.lineWidth = 2;
-                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                }
-
-                // Draw sets
-                const colors = ["#00FF00", "#FFFF00", "#3399FF"];
-                for (let s = 0; s < lastFoundSets.length; s++) {
-                    const color = colors[s % colors.length];
-                    dispCtx.strokeStyle = color;
-                    dispCtx.lineWidth = 4;
-                    for (const idx of lastFoundSets[s]) {
-                        const [x1, y1, x2, y2] = lastDetections[idx].box;
-                        dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                    }
-                }
+                if (!isProcessing) processFrame();
             }
 
             async function processFrame() {
                 isProcessing = true;
 
+                // Segmentation (YOLO)
                 let t0 = performance.now();
                 const yIn = preprocessYOLO();
                 const yOut = await yoloSession.run({
                     [yoloSession.inputNames[0]]: yIn,
                 });
-                const dets = nms(decodeYOLO(yOut[yoloSession.outputNames[0]]));
+                const rawDet = decodeYOLO(yOut[yoloSession.outputNames[0]]);
+                const dets = nms(rawDet);
                 tSeg = performance.now() - t0;
 
-                let t1 = performance.now();
+                // Classification
                 const cards = [];
+                let t1 = performance.now();
 
                 for (const [x1, y1, x2, y2, conf] of dets) {
                     const w = x2 - x1,
@@ -293,6 +288,7 @@
 
                     cropCanvas.width = w;
                     cropCanvas.height = h;
+
                     cropCtx.drawImage(displayCanvas, x1, y1, w, h, 0, 0, w, h);
 
                     const clfIn = preprocessClassifier(w, h);
@@ -310,28 +306,74 @@
                         },
                     });
                 }
+
                 tClf = performance.now() - t1;
 
+                // Find sets
                 let t2 = performance.now();
                 const sets = findSets(cards);
                 tSet = performance.now() - t2;
 
-                // Persist results for holding
-                lastDetections = cards;
-                lastFoundSets = sets;
-                lastUpdateTime = performance.now();
+                // If at least one set exists — pause and display results
+                if (sets.length > 0) {
+                    pausedForResult = true;
+                    lastDetections = cards;
+                    lastFoundSet = sets[0]; // only highlight ONE SET
 
-                // Update card list
-                const list = cards
-                    .map((c, i) => {
-                        const a = c.attrs;
-                        return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
-                    })
-                    .join("\n");
-                document.getElementById("cardList").textContent = list;
+                    renderResultOverlay();
+
+                    nextBtn.style.display = "block";
+                }
 
                 isProcessing = false;
             }
+
+            function renderResultOverlay() {
+                dispCtx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+
+                // Draw all detections
+                dispCtx.strokeStyle = "lime";
+                dispCtx.lineWidth = 2;
+
+                for (const c of lastDetections) {
+                    const [x1, y1, x2, y2] = c.box;
+                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                }
+
+                // Highlight selected set
+                dispCtx.strokeStyle = "yellow";
+                dispCtx.lineWidth = 4;
+
+                for (const idx of lastFoundSet) {
+                    const [x1, y1, x2, y2] = lastDetections[idx].box;
+                    dispCtx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                }
+
+                // Update perf metrics
+                perfBox.textContent =
+                    `seg: ${tSeg.toFixed(1)}ms, ` +
+                    `clf: ${tClf.toFixed(1)}ms, ` +
+                    `set: ${tSet.toFixed(1)}ms`;
+
+                // Update caption
+                const cardLines = lastDetections.map((c, i) => {
+                    const a = c.attrs;
+                    return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
+                });
+                const setLines = sets.map((s, idx) => {
+                    const [i, k, j] = s;
+                    return `Set ${idx + 1}: ${i}, ${k}, ${j}`;
+                });
+
+                const allText = cardLines.concat(setLines).join("\n");
+
+                document.getElementById("cardList").textContent = allText;
+            }
+
+            nextBtn.onclick = () => {
+                pausedForResult = false;
+                nextBtn.style.display = "none";
+            };
 
             async function init() {
                 const stream = await navigator.mediaDevices.getUserMedia({
@@ -342,6 +384,7 @@
                     },
                 });
                 video.srcObject = stream;
+
                 yoloSession = await ort.InferenceSession.create(
                     "segmentationv2.onnx",
                     { executionProviders: ["webgpu"] },
@@ -351,12 +394,15 @@
                     { executionProviders: ["webgpu"] },
                 );
 
-                statusEl.textContent = "Models loaded.";
+                document.getElementById("status").textContent =
+                    "Models loaded.";
 
                 requestAnimationFrame(loop);
             }
+
             init();
         </script>
+
         <script>
             if ("serviceWorker" in navigator) {
                 navigator.serviceWorker
