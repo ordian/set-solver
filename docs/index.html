@@ -150,7 +150,7 @@
              * @param {number} y
              */
             function drawCenteredText(text, x, y) {
-                ctx.font = "20px sans-serif";
+                ctx.font = "30px sans-serif";
                 ctx.fillStyle = "yellow";
                 ctx.textAlign = "center";
                 ctx.textBaseline = "middle";
@@ -361,7 +361,7 @@
             // =================================================
             // Manual Upload
             // =================================================
-            uploadBtn.onchange = (e) => {
+            uploadBtn.onchange = async (e) => {
                 const input = /** @type {HTMLInputElement} */ (e.currentTarget);
                 const file = input.files && input.files[0];
                 if (!file) {
@@ -370,13 +370,22 @@
 
                 const img = new Image();
                 img.onload = () => {
-                    canvas.style.display = "block";
+                    // Stop the loop BEFORE drawing, or video will overwrite the canvas
+                    paused = true;
+
                     video.style.display = "none";
+                    canvas.style.display = "block";
+
+                    // Draw uploaded image
                     ctx.drawImage(img, 0, 0, YOLO_W, YOLO_H);
+
+                    // Now capture image data
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
-                    void processFrame(capturedImage);
-                    URL.revokeObjectURL(img.src);
+
+                    // Process the image
+                    processFrame(capturedImage);
                 };
+
                 img.src = URL.createObjectURL(file);
             };
 
@@ -460,7 +469,7 @@
                 ctx.putImageData(capturedImage, 0, 0);
 
                 // draw all detections
-                ctx.strokeStyle = "lime";
+                ctx.strokeStyle = "white";
                 ctx.lineWidth = 2;
 
                 lastDetections.forEach((c, i) => {
@@ -474,8 +483,8 @@
                 });
 
                 // highlight set
-                ctx.strokeStyle = "yellow";
-                ctx.lineWidth = 4;
+                ctx.strokeStyle = "green";
+                ctx.lineWidth = 5;
                 lastFoundSet.forEach((idx) => {
                     const [x1, y1, x2, y2] = lastDetections[idx].box;
                     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
@@ -492,9 +501,9 @@
                     const a = c.attrs;
                     return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
                 });
-                const setLines = lastSets.map(
-                    (s, i) => `Set ${i + 1}: ${s.join(", ")}`,
-                );
+                const setLines = lastSets.map((s, i) => {
+                    `Set ${i + 1}: ${s.map((x) => x + 1).join(", ")}`;
+                });
 
                 document.getElementById("cardList").textContent = [
                     ...cardLines,
