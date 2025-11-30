@@ -1,9 +1,9 @@
 <!doctype html>
 <html lang="en">
     <head>
+        <meta charset="UTF-8" />
         <link rel="manifest" href="manifest.json" />
         <meta name="theme-color" content="#f5ebdc" />
-        <meta charset="UTF-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
         <title>Set Game Detector</title>
 
@@ -26,6 +26,7 @@
             #status {
                 margin-top: 1rem;
             }
+
             #perfBox {
                 position: absolute;
                 top: 10px;
@@ -38,17 +39,26 @@
                 pointer-events: none;
                 z-index: 5;
             }
-            #nextBtn {
+
+            #nextBtn,
+            #uploadBtn {
                 margin-top: 1rem;
                 padding: 8px 16px;
                 font-size: 15px;
-                display: none;
                 position: relative;
                 z-index: 10;
+                display: none;
+                cursor: pointer;
             }
+
+            #uploadBtn {
+                display: block;
+            } /* always shown */
+
             #mainCanvas {
                 position: relative;
                 z-index: 1;
+                display: none; /* hidden until a set is detected OR manual upload */
             }
         </style>
     </head>
@@ -59,8 +69,9 @@
 
             <video id="video" autoplay playsinline></video>
 
-            <!-- Single unified canvas -->
             <canvas id="mainCanvas" width="640" height="480"></canvas>
+
+            <input type="file" id="uploadBtn" accept="image/*" />
 
             <button id="nextBtn">Next</button>
 
@@ -81,50 +92,85 @@
 
         <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.webgpu.min.js"></script>
         <script>
+            "use strict";
+            // =================================================
+            // Global State
+            // =================================================
             let tSeg = 0,
                 tClf = 0,
                 tSet = 0;
-
             let lastDetections = [];
             let lastFoundSet = null;
             let lastSets = [];
-            let pausedForResult = false;
+            let paused = false;
             let isProcessing = false;
+            let capturedImage = null; // frozen frame as ImageData
 
             const COLORS = ["red", "green", "purple"];
             const SHAPES = ["diamond", "oval", "squiggle"];
             const FILLS = ["solid", "striped", "empty"];
             const COUNTS = ["one", "two", "three"];
 
-            const YOLO_W = 640,
-                YOLO_H = 480,
-                IMG_SIZE = 224;
-            const CONF_THRESH = 0.6,
-                IOU_THRESH = 0.3;
+            const YOLO_W = 640;
+            const YOLO_H = 480;
+            const IMG_SIZE = 224;
+            const CONF_THRESH = 0.6;
+            const IOU_THRESH = 0.3;
 
-            const video = document.getElementById("video");
-            const mainCanvas = document.getElementById("mainCanvas");
-            const ctx = mainCanvas.getContext("2d");
+            const video = /** @type {HTMLVideoElement} */ (
+                document.getElementById("video")
+            );
+            const canvas = /** @type {HTMLCanvasElement} */ (
+                document.getElementById("mainCanvas")
+            );
+            const ctx = canvas.getContext("2d");
 
-            const nextBtn = document.getElementById("nextBtn");
+            const nextBtn = /** @type {HTMLButtonElement} */ (
+                document.getElementById("nextBtn")
+            );
+            const uploadBtn = /** @type {HTMLInputElement} */ (
+                document.getElementById("uploadBtn")
+            );
             const perfBox = document.getElementById("perfBox");
 
-            let yoloSession, clfSession;
+            /** @type {ort.InferenceSession | null} */
+            let yoloSession = null;
+            /** @type {ort.InferenceSession | null} */
+            let clfSession = null;
 
             const cropCanvas = document.createElement("canvas");
             const cropCtx = cropCanvas.getContext("2d");
 
-            /* ---------------- YOLO PREPROCESS ---------------- */
-            function preprocessYOLO() {
-                ctx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
-                const img = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
-                const d = img.data;
+            // =================================================
+            // Utilities
+            // =================================================
+            /**
+             * @param {string|number} text
+             * @param {number} x
+             * @param {number} y
+             */
+            function drawCenteredText(text, x, y) {
+                ctx.font = "20px sans-serif";
+                ctx.fillStyle = "yellow";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+                ctx.fillText(String(text), x, y);
+            }
 
+            // =================================================
+            // Preprocessors
+            // =================================================
+            /**
+             * @param {ImageData} img
+             * @returns {ort.Tensor}
+             */
+            function preprocessYOLO_fromImageData(img) {
+                const d = img.data;
                 const out = new Float32Array(3 * YOLO_W * YOLO_H);
+
                 let r = 0,
                     g = YOLO_W * YOLO_H,
                     b = 2 * YOLO_W * YOLO_H;
-
                 for (let i = 0; i < d.length; i += 4) {
                     out[r++] = d[i] / 255;
                     out[g++] = d[i + 1] / 255;
@@ -133,15 +179,18 @@
                 return new ort.Tensor("float32", out, [1, 3, YOLO_H, YOLO_W]);
             }
 
-            /* ---------------- CLASSIFIER PREPROCESS ---------------- */
-            const mean = [0.485, 0.456, 0.406],
-                std = [0.229, 0.224, 0.225];
+            const mean = [0.485, 0.456, 0.406];
+            const std = [0.229, 0.224, 0.225];
 
+            /**
+             * @param {number} w
+             * @param {number} h
+             * @returns {ort.Tensor}
+             */
             function preprocessClassifier(w, h) {
                 const tmp = document.createElement("canvas");
                 tmp.width = IMG_SIZE;
                 tmp.height = IMG_SIZE;
-
                 const tctx = tmp.getContext("2d");
                 tctx.drawImage(
                     cropCanvas,
@@ -156,12 +205,11 @@
                 );
 
                 const img = tctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE).data;
-
                 const out = new Float32Array(3 * IMG_SIZE * IMG_SIZE);
+
                 let r = 0,
                     g = IMG_SIZE * IMG_SIZE,
                     b = 2 * IMG_SIZE * IMG_SIZE;
-
                 for (let i = 0; i < img.length; i += 4) {
                     out[r++] = (img[i] / 255 - mean[0]) / std[0];
                     out[g++] = (img[i + 1] / 255 - mean[1]) / std[1];
@@ -175,7 +223,13 @@
                 ]);
             }
 
-            /* ---------------- YOLO DECODE + NMS ---------------- */
+            // =================================================
+            // YOLO decode
+            // =================================================
+            /**
+             * @param {ort.Tensor} raw
+             * @returns {Array<[number, number, number, number, number]>}
+             */
             function decodeYOLO(raw) {
                 const arr = raw.data;
                 const stride = 6300;
@@ -186,38 +240,41 @@
                 const conf = arr.subarray(4 * stride, 5 * stride);
 
                 const out = [];
-
                 for (let i = 0; i < stride; i++) {
                     if (conf[i] < CONF_THRESH) continue;
-
                     const x1 = cx[i] - w[i] / 2;
                     const y1 = cy[i] - h[i] / 2;
                     const x2 = cx[i] + w[i] / 2;
                     const y2 = cy[i] + h[i] / 2;
-
                     if (x2 <= x1 || y2 <= y1) continue;
-
                     out.push([x1, y1, x2, y2, conf[i]]);
                 }
                 return out;
             }
 
+            /**
+             * @param {number[]} a
+             * @param {number[]} b
+             * @returns {number}
+             */
             function iou(a, b) {
                 const x1 = Math.max(a[0], b[0]),
                     y1 = Math.max(a[1], b[1]),
                     x2 = Math.min(a[2], b[2]),
-                    y2 = Math.min(a[3], b[3]);
-
-                const w = Math.max(0, x2 - x1),
-                    h = Math.max(0, y2 - y1);
-                const inter = w * h;
+                    y2 = Math.min(a[3], b[3]),
+                    w = Math.max(0, x2 - x1),
+                    h = Math.max(0, y2 - y1),
+                    inter = w * h;
                 if (!inter) return 0;
-
                 const areaA = (a[2] - a[0]) * (a[3] - a[1]);
                 const areaB = (b[2] - b[0]) * (b[3] - b[1]);
                 return inter / (areaA + areaB - inter);
             }
 
+            /**
+             * @param {Array<[number, number, number, number, number]>} boxes
+             * @returns {Array<[number, number, number, number, number]>}
+             */
             function nms(boxes) {
                 boxes.sort((a, b) => b[4] - a[4]);
                 const keep = [];
@@ -229,16 +286,32 @@
                 return keep;
             }
 
+            /**
+             * @param {Float32Array|number[]} a
+             * @returns {number}
+             */
             function argmax(a) {
                 let m = 0;
                 for (let i = 1; i < a.length; i++) if (a[i] > a[m]) m = i;
                 return m;
             }
 
+            // SET rules
+            /**
+             * @param {string|number} a
+             * @param {string|number} b
+             * @param {string|number} c
+             * @returns {boolean}
+             */
             function attrOK(a, b, c) {
                 return (a === b && b === c) || (a !== b && a !== c && b !== c);
             }
-
+            /**
+             * @param {{color:string;shape:string;fill:string;count:string}} a
+             * @param {{color:string;shape:string;fill:string;count:string}} b
+             * @param {{color:string;shape:string;fill:string;count:string}} c
+             * @returns {boolean}
+             */
             function isSet(a, b, c) {
                 return (
                     attrOK(a.color, b.color, c.color) &&
@@ -247,7 +320,10 @@
                     attrOK(a.count, b.count, c.count)
                 );
             }
-
+            /**
+             * @param {{attrs:{color:string;shape:string;fill:string;count:string}}[]} cards
+             * @returns {number[][]}
+             */
             function findSets(cards) {
                 const out = [];
                 for (let i = 0; i < cards.length; i++)
@@ -264,34 +340,67 @@
                 return out;
             }
 
-            /* ---------------- MAIN LOOP ---------------- */
+            // =================================================
+            // Main Loop (only when NOT paused)
+            // =================================================
             async function loop() {
                 requestAnimationFrame(loop);
+                if (paused) return;
 
-                if (pausedForResult) return;
-
-                // live camera
+                // show live video
                 ctx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
 
-                if (!isProcessing) processFrame();
+                if (!isProcessing) {
+                    // capture the current frame as ImageData
+                    capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
+                    // fire and forget; do not await to keep UI responsive
+                    void processFrame(capturedImage);
+                }
             }
 
-            /* ---------------- PROCESS FRAME ---------------- */
-            async function processFrame() {
+            // =================================================
+            // Manual Upload
+            // =================================================
+            uploadBtn.onchange = (e) => {
+                const input = /** @type {HTMLInputElement} */ (e.currentTarget);
+                const file = input.files && input.files[0];
+                if (!file) {
+                    return;
+                }
+
+                const img = new Image();
+                img.onload = () => {
+                    canvas.style.display = "block";
+                    video.style.display = "none";
+                    ctx.drawImage(img, 0, 0, YOLO_W, YOLO_H);
+                    capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
+                    void processFrame(capturedImage);
+                    URL.revokeObjectURL(img.src);
+                };
+                img.src = URL.createObjectURL(file);
+            };
+
+            // =================================================
+            // Process a single frame (stateless)
+            // =================================================
+            /**
+             * @param {ImageData} imageData
+             */
+            async function processFrame(imageData) {
                 isProcessing = true;
 
-                /* --- YOLO --- */
-                let t0 = performance.now();
-                const yIn = preprocessYOLO();
+                // YOLO
+                const t0 = performance.now();
+                const yIn = preprocessYOLO_fromImageData(imageData);
                 const yOut = await yoloSession.run({
                     [yoloSession.inputNames[0]]: yIn,
                 });
                 const dets = nms(decodeYOLO(yOut[yoloSession.outputNames[0]]));
                 tSeg = performance.now() - t0;
 
-                /* --- CLASSIFIER --- */
-                let cards = [];
-                let t1 = performance.now();
+                // Classification
+                const cards = [];
+                const t1 = performance.now();
 
                 for (const [x1, y1, x2, y2, conf] of dets) {
                     const w = x2 - x1,
@@ -300,8 +409,7 @@
 
                     cropCanvas.width = w;
                     cropCanvas.height = h;
-
-                    cropCtx.drawImage(mainCanvas, x1, y1, w, h, 0, 0, w, h);
+                    cropCtx.putImageData(imageData, -x1, -y1);
 
                     const clfIn = preprocessClassifier(w, h);
                     const out = await clfSession.run({
@@ -318,10 +426,11 @@
                         },
                     });
                 }
+
                 tClf = performance.now() - t1;
 
-                /* --- SETS --- */
-                let t2 = performance.now();
+                // Sets
+                const t2 = performance.now();
                 const sets = findSets(cards);
                 tSet = performance.now() - t2;
 
@@ -329,49 +438,63 @@
                 lastSets = sets;
 
                 if (sets.length > 0) {
+                    paused = true;
                     lastFoundSet = sets[0];
-                    pausedForResult = true;
-                    renderResultOverlay();
+                    renderFrozenResults();
                     nextBtn.style.display = "block";
                 }
 
                 isProcessing = false;
             }
 
-            /* ---------------- DRAW RESULT ---------------- */
-            function renderResultOverlay() {
-                // freeze last frame
-                ctx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
+            // =================================================
+            // Draw results using capturedImage
+            // =================================================
+            function renderFrozenResults() {
+                if (!capturedImage) {
+                    return;
+                }
+                video.style.display = "none";
+                canvas.style.display = "block";
+
+                ctx.putImageData(capturedImage, 0, 0);
 
                 // draw all detections
                 ctx.strokeStyle = "lime";
                 ctx.lineWidth = 2;
-                for (const c of lastDetections) {
+
+                lastDetections.forEach((c, i) => {
                     const [x1, y1, x2, y2] = c.box;
                     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                }
 
-                // highlight selected set
+                    // draw card index in center
+                    const cx = (x1 + x2) / 2;
+                    const cy = (y1 + y2) / 2;
+                    drawCenteredText(i + 1, cx, cy);
+                });
+
+                // highlight set
                 ctx.strokeStyle = "yellow";
                 ctx.lineWidth = 4;
-                for (const idx of lastFoundSet) {
+                lastFoundSet.forEach((idx) => {
                     const [x1, y1, x2, y2] = lastDetections[idx].box;
                     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                }
+                });
 
+                // Perf
                 perfBox.textContent =
                     `seg: ${tSeg.toFixed(1)}ms, ` +
                     `clf: ${tClf.toFixed(1)}ms, ` +
                     `set: ${tSet.toFixed(1)}ms`;
 
+                // captions
                 const cardLines = lastDetections.map((c, i) => {
                     const a = c.attrs;
                     return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
                 });
-
-                const setLines = lastSets.map((s, idx) => {
-                    return `Set ${idx + 1}: ${s.join(", ")}`;
-                });
+                const setLines = lastSets.map(
+                    (s, i) => `Set ${i + 1}: ${s.join(", ")}`,
+                );
 
                 document.getElementById("cardList").textContent = [
                     ...cardLines,
@@ -379,18 +502,28 @@
                 ].join("\n");
             }
 
+            // =================================================
+            // Continue Button
+            // =================================================
             nextBtn.onclick = () => {
-                pausedForResult = false;
+                paused = false;
                 nextBtn.style.display = "none";
+                video.style.display = "block";
+                canvas.style.display = "none";
             };
 
-            /* ---------------- INIT ---------------- */
             async function init() {
+                if (!("mediaDevices" in navigator)) {
+                    document.getElementById("status").textContent =
+                        "Camera API not available in this browser.";
+                    return;
+                }
+
                 const stream = await navigator.mediaDevices.getUserMedia({
                     video: {
-                        facingMode: "environment",
-                        width: YOLO_W,
-                        height: YOLO_H,
+                        facingMode: { ideal: "environment" },
+                        width: { ideal: YOLO_W },
+                        height: { ideal: YOLO_H },
                     },
                 });
                 video.srcObject = stream;
@@ -413,12 +546,12 @@
         </script>
 
         <script>
+            "use strict";
+
             if ("serviceWorker" in navigator) {
                 navigator.serviceWorker
                     .register("service-worker.js")
-                    .catch((err) =>
-                        console.error("SW registration failed", err),
-                    );
+                    .catch((e) => console.error("SW registration failed", e));
             }
         </script>
     </body>
