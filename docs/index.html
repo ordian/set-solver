@@ -543,11 +543,17 @@
 
                 yoloSession = await ort.InferenceSession.create(
                     "segmentationv2.onnx",
-                    { executionProviders: ["webgpu"] },
+                    {
+                        executionProviders: ["webgpu"],
+                        graphOptimizationLevel: "all",
+                    },
                 );
                 clfSession = await ort.InferenceSession.create(
                     "classification.onnx",
-                    { executionProviders: ["webgpu"] },
+                    {
+                        executionProviders: ["webgpu"],
+                        graphOptimizationLevel: "all",
+                    },
                 );
 
                 document.getElementById("status").textContent =
