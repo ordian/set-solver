@@ -30,11 +30,13 @@ Usage:
     uv run train_simple.py test image.jpg     # Test full pipeline
 """
 
+import colorsys
 import io
 import json
 import random
 import sys
 from asyncio.unix_events import SelectorEventLoop
+from calendar import c
 from pathlib import Path
 
 import matplotlib.patches as patches
@@ -75,9 +77,11 @@ RGB_MAP = {
         (120, 190, 90),
     ],
     "purple": [
-        (78, 60, 140),
-        (105, 70, 165),
-        (130, 90, 190),
+        (90, 40, 140),
+        (120, 60, 170),
+        (150, 80, 210),
+        (110, 30, 130),
+        (160, 70, 180),
     ],
 }
 
@@ -202,8 +206,8 @@ def strong_perspective_warp(img, bg_color):
 
     def jitter(pt):
         return (
-            pt[0] + random.uniform(-0.15 * w, 0.15 * w),
-            pt[1] + random.uniform(-0.15 * h, 0.15 * h),
+            pt[0] + random.uniform(-0.10 * w, 0.10 * w),
+            pt[1] + random.uniform(-0.10 * h, 0.10 * h),
         )
 
     src = [(0, 0), (w, 0), (w, h), (0, h)]
@@ -232,9 +236,6 @@ def make_tv_transform(bg_color, img_size):
                 p=0.7,
                 fill=bg_color,
             ),
-            transforms.ColorJitter(
-                brightness=0.15, contrast=0.15, saturation=0.03, hue=0.02
-            ),
             transforms.RandomResizedCrop(
                 img_size,
                 scale=(0.9, 1.0),
@@ -246,68 +247,80 @@ def make_tv_transform(bg_color, img_size):
     )
 
 
-def desaturate_pil(img):
-    enhancer = ImageEnhance.Color(img)
-    factor = random.uniform(0.92, 0.98)  # slight desaturation
-    return enhancer.enhance(factor)
+def jitter_hue_saturation(color_name):
+    rgb_list = RGB_MAP[color_name]
+    # pick one canonical color
+    rgb = random.choice(rgb_list)
 
+    r, g, b = [c / 255.0 for c in rgb]  # normalize to 0-1
+    h, s, v = colorsys.rgb_to_hsv(r, g, b)
+    if color_name == "purple":
+        # Real dataset: purple spans blue→violet→magenta
+        h += random.uniform(-0.3, 0.3)
+        s *= random.uniform(0.8, 1.2)  # very washed-out to very saturated
+        v *= random.uniform(0.8, 1.2)  # dark violet to bright lavender
+    else:
+        # Red, green are much more stable in your images
+        h += random.uniform(-0.015, 0.015)
+        s *= random.uniform(0.9, 1.1)
+        v *= random.uniform(0.9, 1.1)
+    # convert back
+    r2, g2, b2 = colorsys.hsv_to_rgb(h, s, v)
 
-def add_final_shadow(img, strength=0.7):
-    """
-    Adds a realistic bottom-right soft shadow *after*
-    all torchvision geometric transforms.
-    Works on a PIL RGB image.
-    """
-    w, h = img.size
-
-    # convert to RGBA for alpha shadow merging
-    base = img.convert("RGBA")
-
-    # shadow layer
-    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(shadow)
-
-    # shadow offset direction (slightly downwards right)
-    off_x = random.randint(6, 14)
-    off_y = random.randint(6, 16)
-
-    # shadow alpha (darkness)
-    alpha = int(90 * strength)
-
-    # shadow rectangle slightly larger than card
-    draw.rectangle(
-        [off_x, off_y, w + off_x, h + off_y],
-        fill=(0, 0, 0, alpha),
+    return (
+        int(min(max(r2 * 255, 0), 255)),
+        int(min(max(g2 * 255, 0), 255)),
+        int(min(max(b2 * 255, 0), 255)),
     )
 
-    # strong blur → soft natural shadow
-    blur = random.uniform(6, 14)
-    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=blur))
 
-    # composite with base
-    out = Image.alpha_composite(shadow, base)
-    return out.convert("RGB")
-
-
-def add_vignette(img):
-    # Convert PIL → NumPy
+def apply_white_balance(img):
     arr = np.array(img).astype(np.float32)
 
+    # Gains similar to camera WB drift
+    r_gain = random.uniform(0.97, 1.03)
+    g_gain = random.uniform(0.97, 1.03)
+    b_gain = random.uniform(0.97, 1.03)
+
+    arr[..., 0] *= r_gain
+    arr[..., 1] *= g_gain
+    arr[..., 2] *= b_gain
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def apply_color_temperature(img):
+    kelvin_shift = random.uniform(-300, 300)
+
+    arr = np.array(img).astype(np.float32)
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+
+    if kelvin_shift > 0:  # warm light (more red/yellow)
+        r *= 1 + (kelvin_shift / 300) * 0.03
+        g *= 1 + (kelvin_shift / 300) * 0.03
+    else:  # cold light (more blue)
+        b *= 1 + (-kelvin_shift / 300) * 0.03
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def uneven_tint(img):
+    arr = np.array(img).astype(np.float32)
     h, w, _ = arr.shape
 
-    # Distance-from-center map
+    # gradient tint like real illumination
+    tint_color = np.array(
+        [random.randint(200, 240), random.randint(200, 240), random.randint(200, 240)],
+        dtype=np.float32,
+    )
+
     Y, X = np.ogrid[:h, :w]
-    dist = (X - w / 2) ** 2 + (Y - h / 2) ** 2
-    dist = dist / dist.max()
+    grad = (X / w) * random.uniform(0.02, 0.10)
 
-    # Strength of vignette (5–12%)
-    strength = random.uniform(0.05, 0.12)
-    vignette = 1 - dist * strength
-
-    arr = arr * vignette[..., None]
+    arr = arr * (1 - grad[..., None]) + tint_color * grad[..., None]
     arr = np.clip(arr, 0, 255).astype(np.uint8)
-
-    # Convert back to PIL
     return Image.fromarray(arr)
 
 
@@ -324,22 +337,6 @@ class SyntheticCardDataset(Dataset):
     def __len__(self):
         return self.length
 
-    # ------------------------------------------------------------
-    # Color jitter for shapes
-    # ------------------------------------------------------------
-    def _jitter_color(self, rgb_list):
-        # pick one canonical color
-        base = random.choice(rgb_list)
-        r, g, b = base
-
-        # stronger jitter
-        J = 20
-        return (
-            np.clip(r + random.randint(-J, J), 0, 255),
-            np.clip(g + random.randint(-J, J), 0, 255),
-            np.clip(b + random.randint(-J, J), 0, 255),
-        )
-
     # --------------------------------------------------------
     # Smooth warm background generator
     # --------------------------------------------------------
@@ -347,44 +344,12 @@ class SyntheticCardDataset(Dataset):
         w = h = self.img_size
 
         # Base warm off-white
-        arr = np.random.normal(215, 10, (h, w, 3)).astype(np.float32)
+        arr = np.random.normal(213, 8, (h, w, 3)).astype(np.float32)
 
-        # --- Add low-frequency texture (fake marble / table) ---
-        # large-scale Perlin-like noise (FBM)
-        freq = random.uniform(1.5, 3.5)
-        y = np.linspace(0, freq * np.pi, h)
-        x = np.linspace(0, freq * np.pi, w)
-        xv, yv = np.meshgrid(x, y)
-        texture = np.sin(xv + random.random() * 5) + np.cos(
-            yv * 0.6 + random.random() * 5
-        )
+        texture = np.random.normal(0, 6, (h, w, 1))
 
-        texture = (texture - texture.min()) / (texture.max() - texture.min())
-        texture = texture * random.uniform(4, 12)  # intensity
+        arr += texture
 
-        arr += texture[..., None]
-
-        # Coarse blotches (fake table imperfections)
-        if random.random() < 0.85:
-            bh, bw = h // 5, w // 5
-            blotch = np.random.normal(0, 14, (bh, bw, 1)).astype(np.float32)
-
-            # Resize to full resolution safely
-            blotch = Image.fromarray(blotch.squeeze().astype(np.float32))
-            blotch = blotch.resize((w, h), resample=Image.BILINEAR)
-            blotch = np.array(blotch)[..., None]  # back to (h, w, 1)
-
-            arr += blotch * random.uniform(0.25, 0.55)
-
-        # --- Add subtle horizontal/vertical gradient ---
-        if random.random() < 0.7:
-            if random.random() < 0.5:
-                grad = np.linspace(0, random.uniform(8, 18), w).reshape(1, w, 1)
-            else:
-                grad = np.linspace(0, random.uniform(8, 18), h).reshape(h, 1, 1)
-            arr += grad
-
-        # --- Mild blur to soften texture ---
         bg = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
         if random.random() < 0.5:
             bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.4, 1.2)))
@@ -512,7 +477,7 @@ class SyntheticCardDataset(Dataset):
         ax.set_ylim(self.img_size, 0)
         ax.axis("off")
 
-        rgb = self._jitter_color(RGB_MAP[color_name])
+        rgb = jitter_hue_saturation(color_name)
 
         w = h = self.img_size
         scale = random.uniform(0.85, 1.05)
@@ -557,39 +522,9 @@ class SyntheticCardDataset(Dataset):
         draw.rectangle([0, 0, w - 1, h - 1], outline=(0, 0, 0, 20), width=2)
         img = Image.alpha_composite(img.convert("RGBA"), outline).convert("RGB")
 
-        # --------------------------------------------
-        # Add subtle darkening near card interior edges
-        # --------------------------------------------
-        arr = np.array(img).astype(np.float32)
-        h, w, _ = arr.shape
-
-        Y, X = np.ogrid[:h, :w]
-        dist = (X - w / 2) ** 2 + (Y - h / 2) ** 2
-        dist = dist / dist.max()
-
-        # --------------------------------------------
-        # AO mask: darker near edges, lighter inside
-        # --------------------------------------------
-        mask = 1 - 0.06 * (1 - dist)
-        mask = mask[..., None]
-        arr *= mask
-
-        # --------------------------------------------
-        # Keep card background bright
-        # --------------------------------------------
-        arr *= random.uniform(1.00, 1.05)
-
-        # --------------------------------------------
-        # Micro texture on the card
-        # --------------------------------------------
-        micro = np.random.normal(0, 4, (h, w, 3)).astype(np.float32)
-        arr += micro
-
-        # Clip & convert once
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-        img = Image.fromarray(arr)
-
-        img = desaturate_pil(img)
+        # img = apply_white_balance(img)
+        # img = apply_color_temperature(img)
+        # img = uneven_tint(img)
 
         # --------------------------------------------
         # Background
@@ -598,15 +533,6 @@ class SyntheticCardDataset(Dataset):
         fill_color = self._avg_color(bg)
 
         bg.paste(img, (0, 0))
-
-        # add subtle table tint
-        tint_strength = random.uniform(0.02, 0.07)
-        tint = np.full(arr.shape, random.randint(205, 230), dtype=np.float32)
-        arr = arr * (1 - tint_strength) + tint * tint_strength
-        img = Image.fromarray(arr.astype(np.uint8))
-
-        bg = self._directional_light(bg)
-        bg = add_vignette(bg)
 
         # --------------------------------------------------------
         # STEP 2 — Strong homography
@@ -640,7 +566,6 @@ class SyntheticCardDataset(Dataset):
         # --------------------------------------------------------
         tv = make_tv_transform(fill_color, self.img_size)
         img = tv(img)
-        img = add_final_shadow(img)
 
         img = transforms.ToTensor()(img)
         img = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img)
@@ -709,69 +634,173 @@ class CardClassifier(nn.Module):
             global_pool="",
         )
 
-        # weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
-        # self.backbone = mobilenet_v3_small(weights=weights)
-        # feat_dim = 0
-        feat_dim = self.backbone.num_features
-        print(">>> num_features says:", feat_dim)
+        # ------------------------------------------------
+        # PROBE MODEL STRUCTURE
+        # ------------------------------------------------
         with torch.no_grad():
-            dummy = torch.zeros(2, 3, IMG_SIZE, IMG_SIZE)
-            real_out = self.backbone(dummy)
-            # if model outputs NCHW, flatten it
-            if real_out.ndim == 4:
-                real_out = real_out.mean(dim=[2, 3])  # global pool if needed
-            feat_dim = real_out.shape[1]
+            dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
+            block_outputs = []
+            x = self.backbone.conv_stem(dummy)
 
-        print(">>> REAL FEATURE DIM =", feat_dim)
+            # MobileNetV3 uses .bn1, LCNet also uses .bn1
+            if hasattr(self.backbone, "bn1"):
+                x = self.backbone.bn1(x)
 
-        # -----------------------------
-        # Shared bottleneck MLP
-        # -----------------------------
-        hidden_in = feat_dim
-        hidden_out = 256
+            for blk in self.backbone.blocks:
+                x = blk(x)
+                block_outputs.append(x.shape[1:])  # (C,H,W)
+
+        self.blocks_out = block_outputs
+
+        # pick color stage at H <= 32
+        self.stage_color = next(
+            i for i, (_, h, _) in enumerate(self.blocks_out) if h <= 32
+        )
+        self.color_in_ch = self.blocks_out[self.stage_color][0]
+
+        # last block index
+        self.stage_final = len(self.blocks_out) - 1
+
+        # ------------------------------------------------
+        # Compute final feature dimension
+        # ------------------------------------------------
+        with torch.no_grad():
+            _, final = self._extract_stages(torch.zeros(1, 3, IMG_SIZE, IMG_SIZE))
+            pooled = final.mean(dim=[2, 3])
+            self.final_dim = pooled.shape[1]
+
+        # ------------------------------------------------
+        # COLOR HEAD (mid-level branch)
+        # ------------------------------------------------
+        self.color_conv = nn.Sequential(
+            nn.Conv2d(self.color_in_ch, 64, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head_color = nn.Linear(32, 3)
+
+        # ------------------------------------------------
+        # SHARED MLP for shape/fill/count
+        # ------------------------------------------------
         self.hidden = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(hidden_in, hidden_out),
+            nn.Dropout(0.30),
+            nn.Linear(self.final_dim, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(0.25),
         )
-        self.color_norm = nn.Conv2d(3, 3, kernel_size=1, bias=True)
-        self.color_norm.weight.data = torch.eye(3).view(3, 3, 1, 1)
-        self.color_norm.bias.data.zero_()
 
-        # Four heads: color, shape, fill, count
-        self.head_color = nn.Linear(hidden_out, 3)
-        self.head_shape = nn.Linear(hidden_out, 3)
-        self.head_fill = nn.Linear(hidden_out, 3)
-        self.head_count = nn.Linear(hidden_out, 3)
+        self.head_shape = nn.Linear(256, 3)
+        self.head_fill = nn.Linear(256, 3)
+        self.head_count = nn.Linear(256, 3)
 
+        # freeze backbone if required
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
+    # ------------------------------------------------
+    # UNIVERSAL FEATURE EXTRACTOR
+    # ------------------------------------------------
+    def _extract_stages(self, x):
+        x = self.backbone.conv_stem(x)
+
+        if hasattr(self.backbone, "bn1"):
+            x = self.backbone.bn1(x)
+
+        early = None
+        for i, blk in enumerate(self.backbone.blocks):
+            x = blk(x)
+            if i == self.stage_color:
+                early = x
+
+        # Now x is the last block output → pass through conv_head
+        if hasattr(self.backbone, "conv_head"):
+            x = self.backbone.conv_head(x)
+
+        # MobileNetV3 has act2; LCNet does not
+        if hasattr(self.backbone, "act2") and self.backbone.act2 is not None:
+            x = self.backbone.act2(x)
+
+        final = x
+        return early, final
+
+    # ------------------------------------------------
     def unfreeze_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
+    # ------------------------------------------------
     def forward(self, x):
-        x = self.color_norm(x)
-        x = self.backbone(x)
-        if x.ndim == 4:
-            x = x.mean(dim=(2, 3))
-        x = self.hidden(x)
+        early, final = self._extract_stages(x)
+
+        color_feats = self.color_conv(early).flatten(1)
+        pooled = final.mean(dim=[2, 3])
+        shared = self.hidden(pooled)
+
         return (
-            self.head_color(x),
-            self.head_shape(x),
-            self.head_fill(x),
-            self.head_count(x),
+            self.head_color(color_feats),
+            self.head_shape(shared),
+            self.head_fill(shared),
+            self.head_count(shared),
         )
+
+    #     # weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
+    #     # self.backbone = mobilenet_v3_small(weights=weights)
+    #     # feat_dim = 0
+    #     feat_dim = self.backbone.num_features
+    #     self.pool = nn.AdaptiveAvgPool2d(1)
+
+    #     # -----------------------------
+    #     # Shared bottleneck MLP
+    #     # -----------------------------
+    #     hidden_in = feat_dim
+    #     hidden_out = 256
+    #     self.hidden = nn.Sequential(
+    #         nn.Dropout(0.2),
+    #         nn.Linear(hidden_in, hidden_out),
+    #         nn.ReLU(inplace=True),
+    #         # nn.Dropout(0.25),
+    #     )
+    #     # ---------------------------------------------------
+    #     # Separate color head
+    #     # ---------------------------------------------------
+    #     self.head_color = nn.Sequential(
+    #         nn.Linear(feat_dim, hidden_out),
+    #         nn.ReLU(inplace=True),
+    #         nn.Linear(hidden_out, 3),
+    #     )
+    #     # Other heads: shape, fill, count
+    #     self.head_shape = nn.Linear(hidden_out, 3)
+    #     self.head_fill = nn.Linear(hidden_out, 3)
+    #     self.head_count = nn.Linear(hidden_out, 3)
+
+    #     if freeze_backbone:
+    #         for p in self.backbone.parameters():
+    #             p.requires_grad = False
+
+    # def unfreeze_backbone(self):
+    #     for p in self.backbone.parameters():
+    #         p.requires_grad = True
+
+    # def forward(self, x):
+    #     feats = self.backbone.forward_features(x)
+    #     pooled = self.pool(feats).flatten(1)
+    #     shared = self.hidden(pooled)
+    #     return (
+    #         self.head_color(pooled),
+    #         self.head_shape(shared),
+    #         self.head_fill(shared),
+    #         self.head_count(shared),
+    #     )
 
 
 # ============================================
 # Training
 # ============================================
 def train_classifier(
-    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 64
+    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 16
 ):
     """Train classifier with synthetic pretrain + real finetune."""
 
@@ -793,7 +822,6 @@ def train_classifier(
             ),
             transforms.RandomRotation(15),
             transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
@@ -854,12 +882,12 @@ def train_classifier(
         final_div_factor=20,  # cooldown
         anneal_strategy="cos",
     )
-
+    criterion_color = nn.CrossEntropyLoss(label_smoothing=0.15)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     def calc_loss(outs, targs):
-        loss = 0
-        for i in range(4):
+        loss = 2.5 * criterion_color(outs[0], targs[:, 0].argmax(dim=1))
+        for i in range(1, 4):
             loss += criterion(outs[i], targs[:, i].argmax(dim=1))
         return loss
 
@@ -908,7 +936,7 @@ def train_classifier(
     mixed_ds = ConcatDataset(
         [
             real_train_ds,
-            SyntheticCardDataset(length=2000, img_size=IMG_SIZE),
+            SyntheticCardDataset(length=600, img_size=IMG_SIZE),
         ]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
