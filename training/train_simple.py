@@ -78,10 +78,13 @@ RGB_MAP = {
         (120, 190, 90),
     ],
     "purple": [
-        (45, 10, 100),  # Deep Indigo
-        (60, 20, 120),  # Dark Violet
-        (55, 15, 110),  # Mid Blue-Purple
-        (40, 10, 90),  # Very dark
+        (75, 40, 140),
+        (60, 30, 120),
+        (90, 50, 160),
+        # (45, 10, 100),  # Deep Indigo
+        # (60, 20, 120),  # Dark Violet
+        # (55, 15, 110),  # Mid Blue-Purple
+        # (40, 10, 90),  # Very dark
     ],
 }
 
@@ -518,8 +521,10 @@ class SyntheticCardDataset(Dataset):
         img = Image.blend(img, blurred, alpha=0.08)
 
         # img = apply_white_balance(img)
-        # img = apply_color_temperature(img)
-        # img = uneven_tint(img)
+        if random.random() < 0.6:
+            img = apply_color_temperature(img)
+        if random.random() < 0.3:
+            img = uneven_tint(img)
 
         # --------------------------------------------
         # Background
@@ -643,13 +648,12 @@ class CardClassifier(nn.Module):
         # SHARED MLP for shape/fill/count
         # ------------------------------------------------
         self.hidden = nn.Sequential(
-            nn.Dropout(0.30),
+            nn.Dropout(0.2),
             nn.Linear(feats_dim, shared_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.25),
+            nn.Hardswish(),  # Faster/better than ReLU in MobileNets
         )
 
-        self.head_color = nn.Linear(shared_dim, 3)
+        self.head_color = nn.Sequential(nn.Dropout(0.2), nn.Linear(feats_dim, 3))
         self.head_shape = nn.Linear(shared_dim, 3)
         self.head_fill = nn.Linear(shared_dim, 3)
         self.head_count = nn.Linear(shared_dim, 3)
@@ -665,10 +669,11 @@ class CardClassifier(nn.Module):
 
     def forward(self, x):
         x = self.backbone(x)
+        color = self.head_color(x)
         y = self.hidden(x)
 
         return (
-            self.head_color(y),
+            color,
             self.head_shape(y),
             self.head_fill(y),
             self.head_count(y),
@@ -700,10 +705,10 @@ def train_classifier(
                 (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
             ),
             transforms.ColorJitter(
-                brightness=0.2, contrast=0.2, saturation=0.1, hue=0.03
+                brightness=0.3, contrast=0.3, saturation=0.3, hue=0.01
             ),
             transforms.RandomRotation(15),
-            transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
+            transforms.RandomPerspective(distortion_scale=0.1, p=0.3),
             transforms.ToTensor(),
             # transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2]),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -821,14 +826,14 @@ def train_classifier(
     mixed_ds = ConcatDataset(
         [
             real_train_ds,
-            SyntheticCardDataset(length=600, img_size=IMG_SIZE),
+            real_train_ds,
+            real_train_ds,
+            SyntheticCardDataset(length=1000, img_size=IMG_SIZE),
         ]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
-    posttrain_finetune = 5
-    real_loader = DataLoader(real_train_ds, batch_size=16, shuffle=True)
 
-    for epoch in range(epochs_finetune + posttrain_finetune):
+    for epoch in range(epochs_finetune):
         # Unfreeze backbone after 5 epochs
         if epoch == 4:
             print(">>> Unfreezing backbone")
@@ -846,8 +851,7 @@ def train_classifier(
 
         model.train()
         total_loss = 0
-        loader = mixed_loader if epoch < epochs_finetune else real_loader
-        for imgs, targs in loader:
+        for imgs, targs in mixed_loader:
             imgs, targs = imgs.to(device), targs.to(device)
             optimizer.zero_grad()
             outs = model(imgs)
@@ -858,14 +862,14 @@ def train_classifier(
             total_loss += loss.item()
 
         accs = validate()
-        mul_acc = reduce(mul, accs)
+        avg_acc = sum(accs) / len(accs)
         print(
-            f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader) + len(real_loader):.3f} - "
-            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={mul_acc:.1f}%)"
+            f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader):.3f} - "
+            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
         )
 
-        if mul_acc > best_acc:
-            best_acc = mul_acc
+        if avg_acc > best_acc:
+            best_acc = avg_acc
             torch.save(model.state_dict(), "runs/card_classifier_best.pt")
 
     torch.save(model.state_dict(), "runs/card_classifier.pt")
