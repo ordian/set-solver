@@ -6,12 +6,12 @@
 #     "onnxruntime",
 #     "onnxscript",
 #     "pillow",
+#     "timm",
 #     "torch",
 #     "torchvision",
 #     "numpy",
 #     "matplotlib",
 #     "svgpathtools",
-#     "opencv-python",
 # ]
 # ///
 """
@@ -30,20 +30,22 @@ Usage:
     uv run train_simple.py test image.jpg     # Test full pipeline
 """
 
+import io
 import json
 import random
 import sys
+from asyncio.unix_events import SelectorEventLoop
 from pathlib import Path
 
-import cv2
 import matplotlib.patches as patches
 import matplotlib.path as mpath
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 from svgpathtools import parse_path
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision import transforms
@@ -53,14 +55,31 @@ from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 # Configuration
 # ============================================
 DATASET_DIR = Path("dataset")
-IMG_SIZE = 224  # Higher resolution for better stripe detection
+# IMG_SIZE = 224
+IMG_SIZE = 112
 
 COLORS = ["red", "green", "purple"]
 SHAPES = ["diamond", "oval", "squiggle"]
 FILLS = ["solid", "striped", "empty"]
 COUNTS = ["one", "two", "three"]
 
-RGB_MAP = {"red": (235, 50, 35), "green": (50, 160, 75), "purple": (100, 40, 160)}
+RGB_MAP = {
+    "red": [
+        (200, 40, 30),
+        (225, 55, 45),
+        (175, 30, 20),
+    ],
+    "green": [
+        (70, 150, 60),
+        (95, 170, 75),
+        (120, 190, 90),
+    ],
+    "purple": [
+        (78, 60, 140),
+        (105, 70, 165),
+        (130, 90, 190),
+    ],
+}
 
 # ============================================
 # SVG-based squiggle path
@@ -162,25 +181,318 @@ names:
 # ============================================
 # Synthetic Card Dataset
 # ============================================
-class SyntheticCardDataset(Dataset):
-    """Generates synthetic Set cards with realistic variations."""
+# ------------------------------------------------------------
+# Strong homography warp helper
+# ------------------------------------------------------------
+def get_perspective_coeffs(src_pts, dst_pts):
+    matrix = []
+    for (x_src, y_src), (x_dst, y_dst) in zip(src_pts, dst_pts):
+        matrix.append([x_src, y_src, 1, 0, 0, 0, -x_dst * x_src, -x_dst * y_src])
+        matrix.append([0, 0, 0, x_src, y_src, 1, -y_dst * x_src, -y_dst * y_src])
 
-    def __init__(self, length=5000, img_size=224, dirty=True):
+    A = np.array(matrix)
+    B = np.array(dst_pts).reshape(8)
+    res = np.linalg.solve(A, B)
+    return res.tolist()
+
+
+def strong_perspective_warp(img, bg_color):
+    """Applies strong perspective like real Set card photos."""
+    w, h = img.size
+
+    def jitter(pt):
+        return (
+            pt[0] + random.uniform(-0.15 * w, 0.15 * w),
+            pt[1] + random.uniform(-0.15 * h, 0.15 * h),
+        )
+
+    src = [(0, 0), (w, 0), (w, h), (0, h)]
+    dst = [jitter(p) for p in src]
+    coeffs = get_perspective_coeffs(src, dst)
+
+    return img.transform(
+        (w, h), Image.PERSPECTIVE, coeffs, Image.BICUBIC, fillcolor=bg_color
+    )
+
+
+def make_tv_transform(bg_color, img_size):
+    # bg_color must be tuple of 3 ints
+    return transforms.Compose(
+        [
+            transforms.RandomAffine(
+                degrees=10,
+                translate=(0.12, 0.12),
+                scale=(0.85, 1.10),
+                shear=(-10, 10),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+                fill=bg_color,
+            ),
+            transforms.RandomPerspective(
+                distortion_scale=0.5,
+                p=0.7,
+                fill=bg_color,
+            ),
+            transforms.ColorJitter(
+                brightness=0.15, contrast=0.15, saturation=0.03, hue=0.02
+            ),
+            transforms.RandomResizedCrop(
+                img_size,
+                scale=(0.9, 1.0),
+                ratio=(0.95, 1.05),
+                interpolation=transforms.InterpolationMode.BOX,
+                # RandomResizedCrop *resamples*, so no fill needed
+            ),
+        ]
+    )
+
+
+def desaturate_pil(img):
+    enhancer = ImageEnhance.Color(img)
+    factor = random.uniform(0.92, 0.98)  # slight desaturation
+    return enhancer.enhance(factor)
+
+
+def add_final_shadow(img, strength=0.7):
+    """
+    Adds a realistic bottom-right soft shadow *after*
+    all torchvision geometric transforms.
+    Works on a PIL RGB image.
+    """
+    w, h = img.size
+
+    # convert to RGBA for alpha shadow merging
+    base = img.convert("RGBA")
+
+    # shadow layer
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(shadow)
+
+    # shadow offset direction (slightly downwards right)
+    off_x = random.randint(6, 14)
+    off_y = random.randint(6, 16)
+
+    # shadow alpha (darkness)
+    alpha = int(90 * strength)
+
+    # shadow rectangle slightly larger than card
+    draw.rectangle(
+        [off_x, off_y, w + off_x, h + off_y],
+        fill=(0, 0, 0, alpha),
+    )
+
+    # strong blur → soft natural shadow
+    blur = random.uniform(6, 14)
+    shadow = shadow.filter(ImageFilter.GaussianBlur(radius=blur))
+
+    # composite with base
+    out = Image.alpha_composite(shadow, base)
+    return out.convert("RGB")
+
+
+def add_vignette(img):
+    # Convert PIL → NumPy
+    arr = np.array(img).astype(np.float32)
+
+    h, w, _ = arr.shape
+
+    # Distance-from-center map
+    Y, X = np.ogrid[:h, :w]
+    dist = (X - w / 2) ** 2 + (Y - h / 2) ** 2
+    dist = dist / dist.max()
+
+    # Strength of vignette (5–12%)
+    strength = random.uniform(0.05, 0.12)
+    vignette = 1 - dist * strength
+
+    arr = arr * vignette[..., None]
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    # Convert back to PIL
+    return Image.fromarray(arr)
+
+
+# ------------------------------------------------------------
+# Synthetic Card Dataset
+# ------------------------------------------------------------
+class SyntheticCardDataset(Dataset):
+    """Photorealistic synthetic Set cards with strong perspective + torchvision aug."""
+
+    def __init__(self, length=5000, img_size=IMG_SIZE):
         self.length = length
         self.img_size = img_size
-        self.dirty = dirty
-        self.transform = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-            ]
-        )
 
     def __len__(self):
         return self.length
 
+    # ------------------------------------------------------------
+    # Color jitter for shapes
+    # ------------------------------------------------------------
+    def _jitter_color(self, rgb_list):
+        # pick one canonical color
+        base = random.choice(rgb_list)
+        r, g, b = base
+
+        # stronger jitter
+        J = 20
+        return (
+            np.clip(r + random.randint(-J, J), 0, 255),
+            np.clip(g + random.randint(-J, J), 0, 255),
+            np.clip(b + random.randint(-J, J), 0, 255),
+        )
+
+    # --------------------------------------------------------
+    # Smooth warm background generator
+    # --------------------------------------------------------
+    def _background(self):
+        w = h = self.img_size
+
+        # Base warm off-white
+        arr = np.random.normal(215, 10, (h, w, 3)).astype(np.float32)
+
+        # --- Add low-frequency texture (fake marble / table) ---
+        # large-scale Perlin-like noise (FBM)
+        freq = random.uniform(1.5, 3.5)
+        y = np.linspace(0, freq * np.pi, h)
+        x = np.linspace(0, freq * np.pi, w)
+        xv, yv = np.meshgrid(x, y)
+        texture = np.sin(xv + random.random() * 5) + np.cos(
+            yv * 0.6 + random.random() * 5
+        )
+
+        texture = (texture - texture.min()) / (texture.max() - texture.min())
+        texture = texture * random.uniform(4, 12)  # intensity
+
+        arr += texture[..., None]
+
+        # Coarse blotches (fake table imperfections)
+        if random.random() < 0.85:
+            bh, bw = h // 5, w // 5
+            blotch = np.random.normal(0, 14, (bh, bw, 1)).astype(np.float32)
+
+            # Resize to full resolution safely
+            blotch = Image.fromarray(blotch.squeeze().astype(np.float32))
+            blotch = blotch.resize((w, h), resample=Image.BILINEAR)
+            blotch = np.array(blotch)[..., None]  # back to (h, w, 1)
+
+            arr += blotch * random.uniform(0.25, 0.55)
+
+        # --- Add subtle horizontal/vertical gradient ---
+        if random.random() < 0.7:
+            if random.random() < 0.5:
+                grad = np.linspace(0, random.uniform(8, 18), w).reshape(1, w, 1)
+            else:
+                grad = np.linspace(0, random.uniform(8, 18), h).reshape(h, 1, 1)
+            arr += grad
+
+        # --- Mild blur to soften texture ---
+        bg = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+        if random.random() < 0.5:
+            bg = bg.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.4, 1.2)))
+
+        return bg
+
+    def _avg_color(self, img):
+        return tuple(
+            np.array(img).reshape(-1, 3).mean(axis=0).astype(np.uint8).tolist()
+        )
+
+    # --------------------------------------------------------
+    # Directional light
+    # --------------------------------------------------------
+    def _directional_light(self, img):
+        arr = np.array(img).astype(np.float32)
+        h, w, _ = arr.shape
+
+        # Random light direction: angle 0–360 deg
+        angle = random.uniform(0, 2 * np.pi)
+        dx = np.cos(angle)
+        dy = np.sin(angle)
+
+        # Create linear light gradient
+        Y, X = np.mgrid[0:h, 0:w]
+        norm = X * dx + Y * dy
+        norm = (norm - norm.min()) / (norm.max() - norm.min())
+
+        # Strength: subtle 5–15%
+        strength = random.uniform(0.05, 0.15)
+        lightmap = 1 + (norm - 0.5) * strength
+
+        arr = arr * lightmap[..., None]
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
+    # --------------------------------------------------------
+    # Camera imperfections
+    # --------------------------------------------------------
+    def _camera_artifacts(self, img):
+        # mild Gaussian blur
+        if random.random() < 0.4:
+            img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.3, 1.0)))
+
+        # add sensor noise
+        arr = np.array(img, dtype=np.int16)
+        noise = np.random.normal(0, 10, arr.shape).astype(np.int16)
+        arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
+        img = Image.fromarray(arr)
+
+        # JPEG artifacts
+        if random.random() < 0.8:
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=random.randint(60, 95))
+            img = Image.open(buf)
+
+        return img
+
+    # ------------------------------------------------------------
+    # Draw a single shape with matplotlib (same logic you had)
+    # ------------------------------------------------------------
+    def _draw_shape(self, ax, shape, fill_type, rgb, rect):
+        x1, y1, x2, y2 = rect
+        w, h = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        color = tuple(c / 255 for c in rgb)
+        face = color if fill_type == "solid" else (0, 0, 0, 0)
+        linewidth = 0.9
+
+        if shape == "oval":
+            patch = patches.FancyBboxPatch(
+                (x1, y1),
+                w,
+                h,
+                boxstyle=f"round,pad=0,rounding_size={h / 2}",
+                edgecolor=color,
+                facecolor=face,
+                linewidth=linewidth,
+            )
+        elif shape == "diamond":
+            verts = [(cx, y1), (x2, cy), (cx, y2), (x1, cy)]
+            patch = patches.Polygon(
+                verts, closed=True, edgecolor=color, facecolor=face, linewidth=linewidth
+            )
+        else:  # squiggle
+            path = _build_squiggle_path_in_rect(x1, y1, x2, y2)
+            patch = patches.PathPatch(
+                path, edgecolor=color, facecolor=face, linewidth=linewidth
+            )
+
+        ax.add_patch(patch)
+
+        if fill_type == "striped":
+            spacing = random.uniform(1.5, 3.0)
+            for x in np.arange(x1 - 10, x2 + 10, spacing):
+                ax.plot(
+                    [x, x],
+                    [y1 - 5, y2 + 5],
+                    color=color,
+                    linewidth=0.3,
+                    clip_path=patch,
+                )
+
+    # ------------------------------------------------------------
+    # Main generator
+    # ------------------------------------------------------------
     def __getitem__(self, idx):
-        # Random attributes
+        # Sample attributes
         color_idx = random.randint(0, 2)
         shape_idx = random.randint(0, 2)
         fill_idx = random.randint(0, 2)
@@ -191,161 +503,158 @@ class SyntheticCardDataset(Dataset):
         fill_name = FILLS[fill_idx]
         count_val = count_idx + 1
 
-        # Random light background
-        bg_color = (
-            random.randint(230, 255),
-            random.randint(230, 255),
-            random.randint(230, 255),
-        )
-        bg_norm = tuple(c / 255.0 for c in bg_color)
-
-        # Create figure
-        dpi = 100
-        fig = Figure(figsize=(self.img_size / dpi, self.img_size / dpi), dpi=dpi)
-        fig.patch.set_facecolor(bg_norm)
+        # --------------------------------------------------------
+        # STEP 1 — Render clean card via matplotlib
+        # --------------------------------------------------------
+        fig = Figure(figsize=(self.img_size / 100, self.img_size / 100), dpi=100)
         ax = fig.add_axes([0, 0, 1, 1])
         ax.set_xlim(0, self.img_size)
         ax.set_ylim(self.img_size, 0)
-        ax.set_aspect("equal", "box")
         ax.axis("off")
-        ax.set_facecolor(bg_norm)
 
-        # Layout calculation
-        w, h = float(self.img_size), float(self.img_size)
-        scale_jitter = random.uniform(0.85, 1.05)
+        rgb = self._jitter_color(RGB_MAP[color_name])
 
-        shape_w = (w / 2.5) * scale_jitter
-        shape_h = (h / 5.0) * scale_jitter
+        w = h = self.img_size
+        scale = random.uniform(0.85, 1.05)
+        shape_w = (w / 2.6) * scale
+        shape_h = (h / 5.2) * scale
 
-        center_x = w / 2.0 + random.randint(-5, 5)
-        center_y = h / 2.0 + random.randint(-5, 5)
+        cx = w / 2 + random.randint(-10, 10)
+        cy = h / 2 + random.randint(-10, 10)
+        spacing = shape_h * 1.45
 
-        spacing = shape_h * 1.4
         if count_val == 1:
-            centers = [(center_x, center_y)]
+            centers = [(cx, cy)]
         elif count_val == 2:
-            centers = [
-                (center_x, center_y - spacing / 2.0),
-                (center_x, center_y + spacing / 2.0),
-            ]
+            centers = [(cx, cy - spacing / 2), (cx, cy + spacing / 2)]
         else:
-            centers = [
-                (center_x, center_y - spacing),
-                (center_x, center_y),
-                (center_x, center_y + spacing),
-            ]
+            centers = [(cx, cy - spacing), (cx, cy), (cx, cy + spacing)]
 
-        # Draw shapes
-        rgb = RGB_MAP[color_name]
-        for cx, cy in centers:
-            x1 = cx - shape_w / 2.0
-            y1 = cy - shape_h / 2.0
-            x2 = cx + shape_w / 2.0
-            y2 = cy + shape_h / 2.0
-            self._add_shape_patch(
-                ax, shape_name, fill_name, rgb, bg_color, (x1, y1, x2, y2)
-            )
+        for x, y in centers:
+            x1 = x - shape_w / 2
+            y1 = y - shape_h / 2
+            x2 = x + shape_w / 2
+            y2 = y + shape_h / 2
+            self._draw_shape(ax, shape_name, fill_name, rgb, (x1, y1, x2, y2))
 
-        # Render to PIL
         canvas = FigureCanvas(fig)
         canvas.draw()
-        rgba = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
-        img = Image.fromarray(rgba, mode="RGBA").convert("RGB")
+        img = Image.fromarray(np.asarray(canvas.buffer_rgba()), "RGBA").convert("RGB")
 
-        # "Dirty" post-processing
-        if self.dirty:
-            rot = random.uniform(-5, 5)
-            img = img.rotate(rot, resample=Image.BICUBIC, fillcolor=bg_color)
+        # remove 1px transparency fringe
+        img_arr = np.array(img)
+        img_arr = np.where(img_arr < 3, 255, img_arr)  # lift transparent edge
+        img = Image.fromarray(img_arr)
 
-            if random.random() > 0.8:
-                img = img.filter(
-                    ImageFilter.GaussianBlur(radius=random.uniform(0.4, 0.8))
-                )
+        blurred = img.filter(ImageFilter.GaussianBlur(radius=3))
+        img = Image.blend(img, blurred, alpha=0.08)
 
-            arr = np.array(img, dtype=np.int16)
-            noise = np.random.normal(0, 4, arr.shape).astype(np.int16)
-            arr = np.clip(arr + noise, 0, 255).astype(np.uint8)
-            img = Image.fromarray(arr, mode="RGB")
+        # --------------------------------------------
+        # Card border
+        # --------------------------------------------
+        outline = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(outline)
+        draw.rectangle([0, 0, w - 1, h - 1], outline=(0, 0, 0, 20), width=2)
+        img = Image.alpha_composite(img.convert("RGBA"), outline).convert("RGB")
 
-        # Target tensor
+        # --------------------------------------------
+        # Add subtle darkening near card interior edges
+        # --------------------------------------------
+        arr = np.array(img).astype(np.float32)
+        h, w, _ = arr.shape
+
+        Y, X = np.ogrid[:h, :w]
+        dist = (X - w / 2) ** 2 + (Y - h / 2) ** 2
+        dist = dist / dist.max()
+
+        # --------------------------------------------
+        # AO mask: darker near edges, lighter inside
+        # --------------------------------------------
+        mask = 1 - 0.06 * (1 - dist)
+        mask = mask[..., None]
+        arr *= mask
+
+        # --------------------------------------------
+        # Keep card background bright
+        # --------------------------------------------
+        arr *= random.uniform(1.00, 1.05)
+
+        # --------------------------------------------
+        # Micro texture on the card
+        # --------------------------------------------
+        micro = np.random.normal(0, 4, (h, w, 3)).astype(np.float32)
+        arr += micro
+
+        # Clip & convert once
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        img = Image.fromarray(arr)
+
+        img = desaturate_pil(img)
+
+        # --------------------------------------------
+        # Background
+        # --------------------------------------------
+        bg = self._background()
+        fill_color = self._avg_color(bg)
+
+        bg.paste(img, (0, 0))
+
+        # add subtle table tint
+        tint_strength = random.uniform(0.02, 0.07)
+        tint = np.full(arr.shape, random.randint(205, 230), dtype=np.float32)
+        arr = arr * (1 - tint_strength) + tint * tint_strength
+        img = Image.fromarray(arr.astype(np.uint8))
+
+        bg = self._directional_light(bg)
+        bg = add_vignette(bg)
+
+        # --------------------------------------------------------
+        # STEP 2 — Strong homography
+        # --------------------------------------------------------
+        img = strong_perspective_warp(img, fill_color)
+
+        if random.random() < 0.5:
+            img = img.transform(
+                img.size,
+                Image.QUAD,
+                data=[
+                    0 + random.randint(-3, 3),
+                    0,
+                    w + random.randint(-3, 3),
+                    0,
+                    w,
+                    h,
+                    0,
+                    h,
+                ],
+                resample=Image.BICUBIC,
+            )
+
+        # --------------------------------------------------------
+        # STEP 4 — Camera-like imperfections
+        # --------------------------------------------------------
+        img = self._camera_artifacts(img)
+
+        # --------------------------------------------------------
+        # STEP 5 — Final torchvision transforms
+        # --------------------------------------------------------
+        tv = make_tv_transform(fill_color, self.img_size)
+        img = tv(img)
+        img = add_final_shadow(img)
+
+        img = transforms.ToTensor()(img)
+        img = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img)
+
+        # --------------------------------------------------------
+        # Targets
+        # --------------------------------------------------------
         target = torch.zeros(4, 3)
-        target[0, color_idx] = 1.0
-        target[1, shape_idx] = 1.0
-        target[2, fill_idx] = 1.0
-        target[3, count_idx] = 1.0
+        target[0, color_idx] = 1
+        target[1, shape_idx] = 1
+        target[2, fill_idx] = 1
+        target[3, count_idx] = 1
 
-        return self.transform(img), target
-
-    @staticmethod
-    def _add_shape_patch(ax, shape, fill_type, color_rgb, bg_rgb, rect):
-        x1, y1, x2, y2 = rect
-        w = x2 - x1
-        h = y2 - y1
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-
-        color = tuple(c / 255.0 for c in color_rgb)
-        bg_color = tuple(c / 255.0 for c in bg_rgb)
-        linewidth = 1.4
-
-        if fill_type == "solid":
-            face = color
-        elif fill_type == "striped":
-            face = bg_color
-        else:
-            face = (0, 0, 0, 0)
-
-        # Create patch based on shape
-        if shape == "oval":
-            rounding_size = h / 2.0
-            patch = patches.FancyBboxPatch(
-                (x1, y1),
-                w,
-                h,
-                boxstyle=f"round,pad=0,rounding_size={rounding_size}",
-                edgecolor=color,
-                facecolor=face,
-                linewidth=linewidth,
-            )
-        elif shape == "diamond":
-            verts = [(cx, y1), (x2, cy), (cx, y2), (x1, cy)]
-            patch = patches.Polygon(
-                verts,
-                closed=True,
-                edgecolor=color,
-                facecolor=face,
-                linewidth=linewidth,
-            )
-        elif shape == "squiggle":
-            path = _build_squiggle_path_in_rect(x1, y1, x2, y2)
-            patch = patches.PathPatch(
-                path,
-                edgecolor=color,
-                facecolor=face,
-                linewidth=linewidth,
-            )
-        else:
-            return
-
-        ax.add_patch(patch)
-
-        # Draw stripes for "striped" fill
-        if fill_type == "striped":
-            stripe_spacing = 4.0
-            stripe_width = 1.0
-            x_start = x1 - stripe_spacing * 2
-            x_end = x2 + stripe_spacing * 2
-            y_top = y1 - 5
-            y_bottom = y2 + 5
-
-            for x in np.arange(x_start, x_end, stripe_spacing):
-                ax.plot(
-                    [x, x],
-                    [y_top, y_bottom],
-                    color=color,
-                    linewidth=stripe_width,
-                    clip_path=patch,
-                )
+        return img, target
 
 
 # ============================================
@@ -387,51 +696,82 @@ class RealCardDataset(Dataset):
 # Model
 # ============================================
 class CardClassifier(nn.Module):
-    """Simplified MobileNetV3 classifier - direct 576->3 heads."""
-
-    def __init__(self, freeze_backbone: bool = True):
+    def __init__(self, freeze_backbone=True):
         super().__init__()
 
-        weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
-        backbone = mobilenet_v3_small(weights=weights)
-        self.features = backbone.features
-        self.avgpool = backbone.avgpool
-
-        if freeze_backbone:
-            for param in self.features.parameters():
-                param.requires_grad = False
-
-        self.dropout = nn.Dropout(0.2)
-
-        # Direct heads from backbone features
-        self.color_head = nn.Linear(576, 3)
-        self.shape_head = nn.Linear(576, 3)
-        self.fill_head = nn.Linear(576, 3)
-        self.count_head = nn.Linear(576, 3)
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.avgpool(x)
-        x = x.flatten(1)
-        x = self.dropout(x)
-
-        return (
-            torch.softmax(self.color_head(x), dim=1),
-            torch.softmax(self.shape_head(x), dim=1),
-            torch.softmax(self.fill_head(x), dim=1),
-            torch.softmax(self.count_head(x), dim=1),
+        self.backbone = timm.create_model(
+            # "efficientformerv2_s0",
+            # "mobileone_s1",
+            # "mobilenetv4_conv_small",
+            "lcnet_100",
+            pretrained=True,
+            num_classes=0,
+            global_pool="",
         )
 
+        # weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
+        # self.backbone = mobilenet_v3_small(weights=weights)
+        # feat_dim = 0
+        feat_dim = self.backbone.num_features
+        print(">>> num_features says:", feat_dim)
+        with torch.no_grad():
+            dummy = torch.zeros(2, 3, IMG_SIZE, IMG_SIZE)
+            real_out = self.backbone(dummy)
+            # if model outputs NCHW, flatten it
+            if real_out.ndim == 4:
+                real_out = real_out.mean(dim=[2, 3])  # global pool if needed
+            feat_dim = real_out.shape[1]
+
+        print(">>> REAL FEATURE DIM =", feat_dim)
+
+        # -----------------------------
+        # Shared bottleneck MLP
+        # -----------------------------
+        hidden_in = feat_dim
+        hidden_out = 256
+        self.hidden = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(hidden_in, hidden_out),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.25),
+        )
+        self.color_norm = nn.Conv2d(3, 3, kernel_size=1, bias=True)
+        self.color_norm.weight.data = torch.eye(3).view(3, 3, 1, 1)
+        self.color_norm.bias.data.zero_()
+
+        # Four heads: color, shape, fill, count
+        self.head_color = nn.Linear(hidden_out, 3)
+        self.head_shape = nn.Linear(hidden_out, 3)
+        self.head_fill = nn.Linear(hidden_out, 3)
+        self.head_count = nn.Linear(hidden_out, 3)
+
+        if freeze_backbone:
+            for p in self.backbone.parameters():
+                p.requires_grad = False
+
     def unfreeze_backbone(self):
-        for param in self.features.parameters():
-            param.requires_grad = True
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+
+    def forward(self, x):
+        x = self.color_norm(x)
+        x = self.backbone(x)
+        if x.ndim == 4:
+            x = x.mean(dim=(2, 3))
+        x = self.hidden(x)
+        return (
+            self.head_color(x),
+            self.head_shape(x),
+            self.head_fill(x),
+            self.head_count(x),
+        )
 
 
 # ============================================
 # Training
 # ============================================
 def train_classifier(
-    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 32
+    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 64
 ):
     """Train classifier with synthetic pretrain + real finetune."""
 
@@ -442,7 +782,7 @@ def train_classifier(
         print(f"Labels not found: {labels_path}")
         return
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "mps" if torch.mps.is_available() else "cpu"
     print(f"Using device: {device}")
 
     # Transforms - use BOX (INTER_AREA equivalent) for better stripe preservation
@@ -452,6 +792,7 @@ def train_classifier(
                 (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
             ),
             transforms.RandomRotation(15),
+            transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
             transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -489,17 +830,37 @@ def train_classifier(
     val_loader = DataLoader(real_val_ds, batch_size=batch_size)
 
     # Synthetic dataset
-    synth_pretrain = SyntheticCardDataset(length=10000, img_size=IMG_SIZE, dirty=True)
+    synth_pretrain = SyntheticCardDataset(length=8000, img_size=IMG_SIZE)
     synth_loader = DataLoader(synth_pretrain, batch_size=batch_size, shuffle=True)
 
     model = CardClassifier(freeze_backbone=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.NLLLoss()
+
+    # --------------------------------------
+    # Learning rate scheduling (warmup + cosine)
+    # --------------------------------------
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=7e-4,
+        weight_decay=0.01,
+    )
+
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=1e-3,  # peak LR
+        steps_per_epoch=len(synth_loader),
+        epochs=epochs_pretrain + epochs_finetune,
+        pct_start=0.10,  # warmup %
+        div_factor=10,  # initial LR = max_lr/10
+        final_div_factor=20,  # cooldown
+        anneal_strategy="cos",
+    )
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
     def calc_loss(outs, targs):
         loss = 0
         for i in range(4):
-            loss += criterion(torch.log(outs[i] + 1e-9), targs[:, i].argmax(dim=1))
+            loss += criterion(outs[i], targs[:, i].argmax(dim=1))
         return loss
 
     def validate():
@@ -532,13 +893,14 @@ def train_classifier(
             loss = calc_loss(outs, targs)
             loss.backward()
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
 
         accs = validate()
         avg_acc = sum(accs) / 4
         print(
             f"Epoch {epoch + 1}/{epochs_pretrain} - Loss: {total_loss / len(synth_loader):.3f} - "
-            f"Val: C={accs[0]:.0f}% S={accs[1]:.0f}% F={accs[2]:.0f}% N={accs[3]:.0f}% (avg={avg_acc:.0f}%)"
+            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
         )
 
     # Phase 2: Finetune on mixed real + synthetic
@@ -546,17 +908,26 @@ def train_classifier(
     mixed_ds = ConcatDataset(
         [
             real_train_ds,
-            SyntheticCardDataset(length=3000, img_size=IMG_SIZE, dirty=True),
+            SyntheticCardDataset(length=2000, img_size=IMG_SIZE),
         ]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
 
     for epoch in range(epochs_finetune):
         # Unfreeze backbone after 5 epochs
-        if epoch == 5:
+        if epoch == 4:
             print(">>> Unfreezing backbone")
             model.unfreeze_backbone()
-            optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+            optimizer = torch.optim.AdamW(
+                [
+                    {"params": model.backbone.parameters(), "lr": 8e-5},
+                    {"params": model.head_color.parameters(), "lr": 3e-4},
+                    {"params": model.head_shape.parameters(), "lr": 2e-4},
+                    {"params": model.head_fill.parameters(), "lr": 2e-4},
+                    {"params": model.head_count.parameters(), "lr": 2e-4},
+                ],
+                weight_decay=0.01,
+            )
 
         model.train()
         total_loss = 0
@@ -567,13 +938,14 @@ def train_classifier(
             loss = calc_loss(outs, targs)
             loss.backward()
             optimizer.step()
+            scheduler.step()
             total_loss += loss.item()
 
         accs = validate()
         avg_acc = sum(accs) / 4
         print(
             f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader):.3f} - "
-            f"Val: C={accs[0]:.0f}% S={accs[1]:.0f}% F={accs[2]:.0f}% N={accs[3]:.0f}% (avg={avg_acc:.0f}%)"
+            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
         )
 
         if avg_acc > best_acc:
@@ -643,7 +1015,7 @@ def extract_crops(model_path: str = "runs/card_detector/weights/best.pt"):
 def preview_synthetic():
     """Generate preview grid of synthetic cards."""
     print("Generating synthetic preview...")
-    ds = SyntheticCardDataset(length=16, img_size=IMG_SIZE, dirty=True)
+    ds = SyntheticCardDataset(length=16, img_size=IMG_SIZE)
     grid_img = Image.new("RGB", (IMG_SIZE * 4, IMG_SIZE * 4))
 
     inv_normalize = transforms.Normalize(
@@ -675,7 +1047,11 @@ def test(image_path: str):
     device = "cpu"
     model = CardClassifier(freeze_backbone=False)
     model.load_state_dict(
-        torch.load("runs/card_classifier.pt", map_location=device, weights_only=True)
+        torch.load(
+            "runs/card_classifier_mobileone_s1.pt",
+            map_location=device,
+            weights_only=True,
+        )
     )
     model.eval()
 
@@ -740,12 +1116,12 @@ def test_onnx(image_path: str):
     # Load ONNX models
     # ----------------------------
     yolo_sess = ort.InferenceSession(
-        "../docs/segmentationv2.onnx", providers=["CPUExecutionProvider"]
+        "../docs/segmentationv3.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "../docs/classification.onnx", providers=["CPUExecutionProvider"]
+        "../docs/classificationv2.onnx", providers=["CPUExecutionProvider"]
     )
-    print("Inputs: ", yolo_sess.get_inputs()[0].shape)
+    print("Cls Inputs: ", clf_sess.get_inputs()[0].shape)
 
     # ----------------------------
     # Utility: preprocess for YOLO
@@ -825,7 +1201,7 @@ def test_onnx(image_path: str):
     # ----------------------------
     # Utility: preprocess crops for classifier
     # ----------------------------
-    IMG_SIZE = 224
+    # IMG_SIZE = 224
 
     def preprocess_classifier(crop):
         crop = crop.resize((IMG_SIZE, IMG_SIZE))
@@ -916,6 +1292,7 @@ def export():
             imgsz=(480, 640),
             opset=18,
             nms=False,  # Web backend doesn't support the instructions :(
+            simplify=True,
         )
         print(f"Detector exported")
 
@@ -937,6 +1314,7 @@ def export():
             opset_version=18,
             export_params=True,
             # do_constant_folding=True,
+            # keep_initializers_as_inputs=False,
         )
         import onnx
         from onnx import numpy_helper
@@ -986,6 +1364,7 @@ if __name__ == "__main__":
         if len(sys.argv) < 3:
             print("Usage: uv run train_simple.py test <image.jpg>")
         else:
+            # test(sys.argv[2])
             test_onnx(sys.argv[2])
     else:
         print(f"Unknown command: {cmd}")
