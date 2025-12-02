@@ -35,8 +35,8 @@ import io
 import json
 import random
 import sys
-from asyncio.unix_events import SelectorEventLoop
-from calendar import c
+from functools import reduce
+from operator import mul
 from pathlib import Path
 
 import matplotlib.patches as patches
@@ -47,11 +47,12 @@ import torch
 import torch.nn as nn
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 from svgpathtools import parse_path
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision import transforms
-from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
+
+# from torchvision.models import MobileNet_V3_Small_Weights, mobilenet_v3_small
 
 # ============================================
 # Configuration
@@ -77,11 +78,10 @@ RGB_MAP = {
         (120, 190, 90),
     ],
     "purple": [
-        (90, 40, 140),
-        (120, 60, 170),
-        (150, 80, 210),
-        (110, 30, 130),
-        (160, 70, 180),
+        (45, 10, 100),  # Deep Indigo
+        (60, 20, 120),  # Dark Violet
+        (55, 15, 110),  # Mid Blue-Purple
+        (40, 10, 90),  # Very dark
     ],
 }
 
@@ -232,7 +232,7 @@ def make_tv_transform(bg_color, img_size):
                 fill=bg_color,
             ),
             transforms.RandomPerspective(
-                distortion_scale=0.5,
+                distortion_scale=0.3,
                 p=0.7,
                 fill=bg_color,
             ),
@@ -255,10 +255,13 @@ def jitter_hue_saturation(color_name):
     r, g, b = [c / 255.0 for c in rgb]  # normalize to 0-1
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
     if color_name == "purple":
-        # Real dataset: purple spans blue→violet→magenta
-        h += random.uniform(-0.3, 0.3)
-        s *= random.uniform(0.8, 1.2)  # very washed-out to very saturated
-        v *= random.uniform(0.8, 1.2)  # dark violet to bright lavender
+        # TIGHT hue control.
+        # +/- 0.03 keeps it blue-violet. +/- 0.30 was turning it pink/green.
+        h += random.uniform(-0.03, 0.03)
+
+        # Allow brightness (V) to vary, but keep saturation (S) high
+        s *= random.uniform(0.9, 1.1)
+        v *= random.uniform(0.7, 1.3)  # Allow dark cards
     else:
         # Red, green are much more stable in your images
         h += random.uniform(-0.015, 0.015)
@@ -514,14 +517,6 @@ class SyntheticCardDataset(Dataset):
         blurred = img.filter(ImageFilter.GaussianBlur(radius=3))
         img = Image.blend(img, blurred, alpha=0.08)
 
-        # --------------------------------------------
-        # Card border
-        # --------------------------------------------
-        outline = Image.new("RGBA", img.size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(outline)
-        draw.rectangle([0, 0, w - 1, h - 1], outline=(0, 0, 0, 20), width=2)
-        img = Image.alpha_composite(img.convert("RGBA"), outline).convert("RGB")
-
         # img = apply_white_balance(img)
         # img = apply_color_temperature(img)
         # img = uneven_tint(img)
@@ -568,6 +563,8 @@ class SyntheticCardDataset(Dataset):
         img = tv(img)
 
         img = transforms.ToTensor()(img)
+
+        # img = transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2])(img)
         img = transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])(img)
 
         # --------------------------------------------------------
@@ -627,180 +624,62 @@ class CardClassifier(nn.Module):
         self.backbone = timm.create_model(
             # "efficientformerv2_s0",
             # "mobileone_s1",
-            # "mobilenetv4_conv_small",
-            "lcnet_100",
+            "mobilenetv4_conv_small",
+            # "lcnet_100",
             pretrained=True,
             num_classes=0,
-            global_pool="",
+            # global_pool="",
         )
 
-        # ------------------------------------------------
-        # PROBE MODEL STRUCTURE
-        # ------------------------------------------------
+        # feats_dim = 384
+        shared_dim = 128
         with torch.no_grad():
             dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
-            block_outputs = []
-            x = self.backbone.conv_stem(dummy)
-
-            # MobileNetV3 uses .bn1, LCNet also uses .bn1
-            if hasattr(self.backbone, "bn1"):
-                x = self.backbone.bn1(x)
-
-            for blk in self.backbone.blocks:
-                x = blk(x)
-                block_outputs.append(x.shape[1:])  # (C,H,W)
-
-        self.blocks_out = block_outputs
-
-        # pick color stage at H <= 32
-        self.stage_color = next(
-            i for i, (_, h, _) in enumerate(self.blocks_out) if h <= 32
-        )
-        self.color_in_ch = self.blocks_out[self.stage_color][0]
-
-        # last block index
-        self.stage_final = len(self.blocks_out) - 1
-
-        # ------------------------------------------------
-        # Compute final feature dimension
-        # ------------------------------------------------
-        with torch.no_grad():
-            _, final = self._extract_stages(torch.zeros(1, 3, IMG_SIZE, IMG_SIZE))
-            pooled = final.mean(dim=[2, 3])
-            self.final_dim = pooled.shape[1]
-
-        # ------------------------------------------------
-        # COLOR HEAD (mid-level branch)
-        # ------------------------------------------------
-        self.color_conv = nn.Sequential(
-            nn.Conv2d(self.color_in_ch, 64, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 32, 3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1),
-        )
-        self.head_color = nn.Linear(32, 3)
+            self.backbone.eval()
+            real_out = self.backbone(dummy)
+            feats_dim = real_out.shape[1]
 
         # ------------------------------------------------
         # SHARED MLP for shape/fill/count
         # ------------------------------------------------
         self.hidden = nn.Sequential(
             nn.Dropout(0.30),
-            nn.Linear(self.final_dim, 256),
+            nn.Linear(feats_dim, shared_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(0.25),
         )
 
-        self.head_shape = nn.Linear(256, 3)
-        self.head_fill = nn.Linear(256, 3)
-        self.head_count = nn.Linear(256, 3)
+        self.head_color = nn.Linear(shared_dim, 3)
+        self.head_shape = nn.Linear(shared_dim, 3)
+        self.head_fill = nn.Linear(shared_dim, 3)
+        self.head_count = nn.Linear(shared_dim, 3)
 
         # freeze backbone if required
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
-    # ------------------------------------------------
-    # UNIVERSAL FEATURE EXTRACTOR
-    # ------------------------------------------------
-    def _extract_stages(self, x):
-        x = self.backbone.conv_stem(x)
-
-        if hasattr(self.backbone, "bn1"):
-            x = self.backbone.bn1(x)
-
-        early = None
-        for i, blk in enumerate(self.backbone.blocks):
-            x = blk(x)
-            if i == self.stage_color:
-                early = x
-
-        # Now x is the last block output → pass through conv_head
-        if hasattr(self.backbone, "conv_head"):
-            x = self.backbone.conv_head(x)
-
-        # MobileNetV3 has act2; LCNet does not
-        if hasattr(self.backbone, "act2") and self.backbone.act2 is not None:
-            x = self.backbone.act2(x)
-
-        final = x
-        return early, final
-
-    # ------------------------------------------------
     def unfreeze_backbone(self):
         for p in self.backbone.parameters():
             p.requires_grad = True
 
-    # ------------------------------------------------
     def forward(self, x):
-        early, final = self._extract_stages(x)
-
-        color_feats = self.color_conv(early).flatten(1)
-        pooled = final.mean(dim=[2, 3])
-        shared = self.hidden(pooled)
+        x = self.backbone(x)
+        y = self.hidden(x)
 
         return (
-            self.head_color(color_feats),
-            self.head_shape(shared),
-            self.head_fill(shared),
-            self.head_count(shared),
+            self.head_color(y),
+            self.head_shape(y),
+            self.head_fill(y),
+            self.head_count(y),
         )
-
-    #     # weights = MobileNet_V3_Small_Weights.IMAGENET1K_V1
-    #     # self.backbone = mobilenet_v3_small(weights=weights)
-    #     # feat_dim = 0
-    #     feat_dim = self.backbone.num_features
-    #     self.pool = nn.AdaptiveAvgPool2d(1)
-
-    #     # -----------------------------
-    #     # Shared bottleneck MLP
-    #     # -----------------------------
-    #     hidden_in = feat_dim
-    #     hidden_out = 256
-    #     self.hidden = nn.Sequential(
-    #         nn.Dropout(0.2),
-    #         nn.Linear(hidden_in, hidden_out),
-    #         nn.ReLU(inplace=True),
-    #         # nn.Dropout(0.25),
-    #     )
-    #     # ---------------------------------------------------
-    #     # Separate color head
-    #     # ---------------------------------------------------
-    #     self.head_color = nn.Sequential(
-    #         nn.Linear(feat_dim, hidden_out),
-    #         nn.ReLU(inplace=True),
-    #         nn.Linear(hidden_out, 3),
-    #     )
-    #     # Other heads: shape, fill, count
-    #     self.head_shape = nn.Linear(hidden_out, 3)
-    #     self.head_fill = nn.Linear(hidden_out, 3)
-    #     self.head_count = nn.Linear(hidden_out, 3)
-
-    #     if freeze_backbone:
-    #         for p in self.backbone.parameters():
-    #             p.requires_grad = False
-
-    # def unfreeze_backbone(self):
-    #     for p in self.backbone.parameters():
-    #         p.requires_grad = True
-
-    # def forward(self, x):
-    #     feats = self.backbone.forward_features(x)
-    #     pooled = self.pool(feats).flatten(1)
-    #     shared = self.hidden(pooled)
-    #     return (
-    #         self.head_color(pooled),
-    #         self.head_shape(shared),
-    #         self.head_fill(shared),
-    #         self.head_count(shared),
-    #     )
 
 
 # ============================================
 # Training
 # ============================================
 def train_classifier(
-    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 16
+    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 32
 ):
     """Train classifier with synthetic pretrain + real finetune."""
 
@@ -820,9 +699,13 @@ def train_classifier(
             transforms.Resize(
                 (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
             ),
+            transforms.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.1, hue=0.03
+            ),
             transforms.RandomRotation(15),
             transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
             transforms.ToTensor(),
+            # transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2]),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
@@ -833,6 +716,7 @@ def train_classifier(
                 (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
             ),
             transforms.ToTensor(),
+            # transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2]),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ]
     )
@@ -885,8 +769,9 @@ def train_classifier(
     criterion_color = nn.CrossEntropyLoss(label_smoothing=0.15)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-    def calc_loss(outs, targs):
-        loss = 2.5 * criterion_color(outs[0], targs[:, 0].argmax(dim=1))
+    def calc_loss(outs, targs, finetuning=False):
+        m = 2.0 if finetuning else 1.0
+        loss = m * criterion_color(outs[0], targs[:, 0].argmax(dim=1))
         for i in range(1, 4):
             loss += criterion(outs[i], targs[:, i].argmax(dim=1))
         return loss
@@ -940,44 +825,47 @@ def train_classifier(
         ]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
+    posttrain_finetune = 5
+    real_loader = DataLoader(real_train_ds, batch_size=16, shuffle=True)
 
-    for epoch in range(epochs_finetune):
+    for epoch in range(epochs_finetune + posttrain_finetune):
         # Unfreeze backbone after 5 epochs
         if epoch == 4:
             print(">>> Unfreezing backbone")
             model.unfreeze_backbone()
             optimizer = torch.optim.AdamW(
                 [
-                    {"params": model.backbone.parameters(), "lr": 8e-5},
-                    {"params": model.head_color.parameters(), "lr": 3e-4},
-                    {"params": model.head_shape.parameters(), "lr": 2e-4},
-                    {"params": model.head_fill.parameters(), "lr": 2e-4},
-                    {"params": model.head_count.parameters(), "lr": 2e-4},
+                    {"params": model.backbone.parameters(), "lr": 1e-4},
+                    {"params": model.head_color.parameters(), "lr": 5e-4},
+                    {"params": model.head_shape.parameters(), "lr": 3e-4},
+                    {"params": model.head_fill.parameters(), "lr": 3e-4},
+                    {"params": model.head_count.parameters(), "lr": 3e-4},
                 ],
                 weight_decay=0.01,
             )
 
         model.train()
         total_loss = 0
-        for imgs, targs in mixed_loader:
+        loader = mixed_loader if epoch < epochs_finetune else real_loader
+        for imgs, targs in loader:
             imgs, targs = imgs.to(device), targs.to(device)
             optimizer.zero_grad()
             outs = model(imgs)
-            loss = calc_loss(outs, targs)
+            loss = calc_loss(outs, targs, finetuning=True)
             loss.backward()
             optimizer.step()
             scheduler.step()
             total_loss += loss.item()
 
         accs = validate()
-        avg_acc = sum(accs) / 4
+        mul_acc = reduce(mul, accs)
         print(
-            f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader):.3f} - "
-            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
+            f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader) + len(real_loader):.3f} - "
+            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={mul_acc:.1f}%)"
         )
 
-        if avg_acc > best_acc:
-            best_acc = avg_acc
+        if mul_acc > best_acc:
+            best_acc = mul_acc
             torch.save(model.state_dict(), "runs/card_classifier_best.pt")
 
     torch.save(model.state_dict(), "runs/card_classifier.pt")
@@ -1147,7 +1035,7 @@ def test_onnx(image_path: str):
         "../docs/segmentationv3.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "../docs/classificationv2.onnx", providers=["CPUExecutionProvider"]
+        "runs/card_classifier_lcnet_v2.onnx", providers=["CPUExecutionProvider"]
     )
     print("Cls Inputs: ", clf_sess.get_inputs()[0].shape)
 
@@ -1324,7 +1212,7 @@ def export():
         )
         print(f"Detector exported")
 
-    classifier_path = "runs/card_classifier.pt"
+    classifier_path = "runs/card_classifier_best.pt"
     if Path(classifier_path).exists():
         model = CardClassifier(freeze_backbone=False)
         model.load_state_dict(
@@ -1358,7 +1246,7 @@ def export():
                 init.data_location = onnx.TensorProto.DEFAULT
                 init.raw_data = array.tobytes()
 
-        onnx.save(model, "runs/card_classifier_single.onnx")
+        onnx.save(model, "runs/card_classifier_lcnet_v2.onnx")
 
         print(f"Classifier exported: runs/card_classifier.onnx")
 
