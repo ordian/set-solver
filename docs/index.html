@@ -65,7 +65,7 @@
 
     <body>
         <div id="container">
-            <h2>Set Game Detection v1.7</h2>
+            <h2>Set Game Detection v1.8</h2>
 
             <video id="video" autoplay playsinline></video>
 
@@ -123,7 +123,7 @@
             const canvas = /** @type {HTMLCanvasElement} */ (
                 document.getElementById("mainCanvas")
             );
-            const ctx = canvas.getContext("2d");
+            const ctx = canvas.getContext("2d", { willReadFrequently: true });
 
             const nextBtn = /** @type {HTMLButtonElement} */ (
                 document.getElementById("nextBtn")
@@ -132,6 +132,7 @@
                 document.getElementById("uploadBtn")
             );
             const perfBox = document.getElementById("perfBox");
+            const statusDiv = document.getElementById("status");
 
             /** @type {ort.InferenceSession | null} */
             let yoloSession = null;
@@ -525,40 +526,60 @@
                 canvas.style.display = "none";
             };
 
+            function isMobile() {
+                const ua = navigator.userAgent || navigator.vendor;
+                return /Android|webOS|iPhone|iPad/i.test(ua);
+            }
+
             async function init() {
-                if (!("mediaDevices" in navigator)) {
-                    document.getElementById("status").textContent =
-                        "Camera API not available in this browser.";
-                    return;
+                try {
+                    if (!("mediaDevices" in navigator)) {
+                        throw new Error("Camera API not available");
+                    }
+
+                    // 1. Determine Backend
+                    // Mobile -> WebGPU (Fast, working for you)
+                    // Desktop -> WASM (CPU, slower but stable, fixes the freeze)
+                    const useWebGPU = isMobile();
+                    const provider = useWebGPU ? "webgpu" : "wasm";
+
+                    console.log(`Device: ${useWebGPU ? "Mobile" : "Desktop"}`);
+                    console.log(
+                        `Switching backend to: ${provider.toUpperCase()}`,
+                    );
+
+                    statusDiv.textContent = `Loading models (${provider.toUpperCase()})...`;
+
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: { ideal: "environment" },
+                            width: { ideal: YOLO_W },
+                            height: { ideal: YOLO_H },
+                        },
+                    });
+                    video.srcObject = stream;
+
+                    const sessionOptions = {
+                        executionProviders: [provider],
+                        graphOptimizationLevel: "all",
+                    };
+
+                    // Load Models
+                    yoloSession = await ort.InferenceSession.create(
+                        "segmentationv3.onnx",
+                        sessionOptions,
+                    );
+                    clfSession = await ort.InferenceSession.create(
+                        "classificationv3.onnx",
+                        sessionOptions,
+                    );
+
+                    statusDiv.textContent = `Ready (${provider}).`;
+                    requestAnimationFrame(loop);
+                } catch (e) {
+                    console.error(e);
+                    statusDiv.textContent = "Init Error: " + (e.message || e);
                 }
-
-                const stream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: { ideal: "environment" },
-                        width: { ideal: YOLO_W },
-                        height: { ideal: YOLO_H },
-                    },
-                });
-                video.srcObject = stream;
-
-                yoloSession = await ort.InferenceSession.create(
-                    "segmentationv3.onnx",
-                    {
-                        executionProviders: ["webgpu"],
-                        graphOptimizationLevel: "all",
-                    },
-                );
-                clfSession = await ort.InferenceSession.create(
-                    "classificationv3.onnx",
-                    {
-                        executionProviders: ["webgpu"],
-                        graphOptimizationLevel: "all",
-                    },
-                );
-
-                document.getElementById("status").textContent =
-                    "Models loaded.";
-                requestAnimationFrame(loop);
             }
 
             init();
