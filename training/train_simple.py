@@ -62,7 +62,8 @@ from torchvision import transforms
 DATASET_DIR = Path("dataset")
 # IMG_SIZE = 224
 # IMG_SIZE = 112
-IMG_SIZE = 160
+# IMG_SIZE = 160
+IMG_SIZE = 128
 
 COLORS = ["red", "green", "purple"]
 SHAPES = ["diamond", "oval", "squiggle"]
@@ -806,7 +807,7 @@ def train_classifier(
         all_labels = json.load(f)
 
     all_images = list(all_labels.keys())
-    random.seed(71)
+    random.seed(42)
     random.shuffle(all_images)
     train_size = int(0.7 * len(all_images))
 
@@ -915,7 +916,7 @@ def train_classifier(
     # Phase 2: Finetune on mixed real + synthetic
     print(f"\n=== Phase 2: Mixed Finetuning ({epochs_finetune} epochs) ===")
     mixed_ds = ConcatDataset(
-        [real_train_ds] * 5 + [SyntheticCardDataset(length=1000, img_size=IMG_SIZE)]
+        [real_train_ds] * 4 + [SyntheticCardDataset(length=1000, img_size=IMG_SIZE)]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
 
@@ -1289,7 +1290,7 @@ def test_onnx(image_path: str):
         "../docs/segmentationv3.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "runs/card_classifier_mn4s_v3.onnx", providers=["CPUExecutionProvider"]
+        "../docs/classificationv2.onnx", providers=["CPUExecutionProvider"]
     )
     print("Cls Inputs: ", clf_sess.get_inputs()[0].shape)
 
@@ -1466,7 +1467,7 @@ def export():
         )
         print(f"Detector exported")
 
-    classifier_path = "runs/card_classifier_best.pt"
+    classifier_path = "runs/card_classifier.pt"
     if Path(classifier_path).exists():
         model = CardClassifier(freeze_backbone=False)
         model.load_state_dict(

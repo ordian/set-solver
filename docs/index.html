@@ -113,7 +113,7 @@
 
             const YOLO_W = 640;
             const YOLO_H = 480;
-            const IMG_SIZE = 224;
+            const IMG_SIZE = 128;
             const CONF_THRESH = 0.7;
             const IOU_THRESH = 0.5;
 
@@ -542,14 +542,14 @@
                 video.srcObject = stream;
 
                 yoloSession = await ort.InferenceSession.create(
-                    "segmentationv2.onnx",
+                    "segmentationv3.onnx",
                     {
                         executionProviders: ["webgpu"],
                         graphOptimizationLevel: "all",
                     },
                 );
                 clfSession = await ort.InferenceSession.create(
-                    "classification.onnx",
+                    "classificationv2.onnx",
                     {
                         executionProviders: ["webgpu"],
                         graphOptimizationLevel: "all",
