@@ -1,4 +1,4 @@
-const CACHE_NAME = "set-detector-cache-v1";
+const CACHE_NAME = "set-detector-cache-v2";
 
 const ASSETS = [
   "/",
@@ -6,7 +6,7 @@ const ASSETS = [
   "/manifest.json",
   "/icon-192.png",
   "/icon-512.png",
-  "/segmentationv2.onnx",
+  "/segmentationv3.onnx",
   "/classificationv3.onnx",
 ];
 

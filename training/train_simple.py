@@ -1110,7 +1110,7 @@ def test(image_path: str):
     print(f"\nAnnotated image saved: {output_path}")
 
 
-def analyze_failures(model_path="runs/card_classifier_mn4s_v3.pt"):
+def analyze_failures(model_path="runs/card_classifier.pt"):
     from torchvision.utils import save_image
 
     device = "mps" if torch.mps.is_available() else "cpu"
@@ -1176,7 +1176,7 @@ def analyze_failures(model_path="runs/card_classifier_mn4s_v3.pt"):
 # ============================================
 # Data Cleaning Tools
 # ============================================
-def find_label_errors(model_path="runs/card_classifier_best.pt"):
+def find_label_errors(model_path="runs/card_classifier.pt"):
     """
     1. Runs inference on ALL real crops.
     2. If Prediction != Label, saves image to 'suspicious_labels/'
