@@ -65,7 +65,7 @@
 
     <body>
         <div id="container">
-            <h2>Set Game Detection v1.6</h2>
+            <h2>Set Game Detection v1.7</h2>
 
             <video id="video" autoplay playsinline></video>
 
@@ -113,19 +113,24 @@
 
             const YOLO_W = 640;
             const YOLO_H = 480;
-            const IMG_SIZE = 128; // Classifier input size
+            const IMG_SIZE = 128;
             const CONF_THRESH = 0.7;
             const IOU_THRESH = 0.5;
 
-            const MEAN = [0.485, 0.456, 0.406];
-            const STD = [0.229, 0.224, 0.225];
+            const video = /** @type {HTMLVideoElement} */ (
+                document.getElementById("video")
+            );
+            const canvas = /** @type {HTMLCanvasElement} */ (
+                document.getElementById("mainCanvas")
+            );
+            const ctx = canvas.getContext("2d");
 
-            const video = document.getElementById("video");
-            const canvas = document.getElementById("mainCanvas");
-            const ctx = canvas.getContext("2d", { willReadFrequently: true });
-
-            const nextBtn = document.getElementById("nextBtn");
-            const uploadBtn = document.getElementById("uploadBtn");
+            const nextBtn = /** @type {HTMLButtonElement} */ (
+                document.getElementById("nextBtn")
+            );
+            const uploadBtn = /** @type {HTMLInputElement} */ (
+                document.getElementById("uploadBtn")
+            );
             const perfBox = document.getElementById("perfBox");
 
             /** @type {ort.InferenceSession | null} */
@@ -133,9 +138,17 @@
             /** @type {ort.InferenceSession | null} */
             let clfSession = null;
 
+            const cropCanvas = document.createElement("canvas");
+            const cropCtx = cropCanvas.getContext("2d");
+
             // =================================================
             // Utilities
             // =================================================
+            /**
+             * @param {string|number} text
+             * @param {number} x
+             * @param {number} y
+             */
             function drawCenteredText(text, x, y) {
                 ctx.font = "30px sans-serif";
                 ctx.fillStyle = "yellow";
@@ -144,96 +157,66 @@
                 ctx.fillText(String(text), x, y);
             }
 
-            function argmaxOffset(data, offset, length) {
-                let maxIdx = 0;
-                let maxVal = data[offset];
-                for (let i = 1; i < length; i++) {
-                    if (data[offset + i] > maxVal) {
-                        maxVal = data[offset + i];
-                        maxIdx = i;
-                    }
-                }
-                return maxIdx;
-            }
-
             // =================================================
-            // Preprocessors (Stateless & Safe)
+            // Preprocessors
             // =================================================
+            /**
+             * @param {ImageData} img
+             * @returns {ort.Tensor}
+             */
             function preprocessYOLO_fromImageData(img) {
-                // Allocate new buffer per frame to prevent race conditions
-                const out = new Float32Array(3 * YOLO_W * YOLO_H);
                 const d = img.data;
+                const out = new Float32Array(3 * YOLO_W * YOLO_H);
+
                 let r = 0,
                     g = YOLO_W * YOLO_H,
                     b = 2 * YOLO_W * YOLO_H;
                 for (let i = 0; i < d.length; i += 4) {
-                    out[r++] = d[i] / 255.0;
-                    out[g++] = d[i + 1] / 255.0;
-                    out[b++] = d[i + 2] / 255.0;
+                    out[r++] = d[i] / 255;
+                    out[g++] = d[i + 1] / 255;
+                    out[b++] = d[i + 2] / 255;
                 }
                 return new ort.Tensor("float32", out, [1, 3, YOLO_H, YOLO_W]);
             }
 
+            const mean = [0.485, 0.456, 0.406];
+            const std = [0.229, 0.224, 0.225];
+
             /**
-             * Batched Preprocessing
-             * Creates a tensor [N, 3, 128, 128]
+             * @param {number} w
+             * @param {number} h
+             * @returns {ort.Tensor}
              */
-            function preprocessBatch(boxes, sourceBitmap) {
-                const N = boxes.length;
-                if (N === 0) return null;
+            function preprocessClassifier(w, h) {
+                const tmp = document.createElement("canvas");
+                tmp.width = IMG_SIZE;
+                tmp.height = IMG_SIZE;
+                const tctx = tmp.getContext("2d");
+                tctx.drawImage(
+                    cropCanvas,
+                    0,
+                    0,
+                    w,
+                    h,
+                    0,
+                    0,
+                    IMG_SIZE,
+                    IMG_SIZE,
+                );
 
-                // Create a local canvas for this batch to avoid global state conflicts
-                const batchCanvas = document.createElement("canvas");
-                batchCanvas.width = IMG_SIZE;
-                batchCanvas.height = IMG_SIZE;
-                const batchCtx = batchCanvas.getContext("2d", {
-                    willReadFrequently: true,
-                });
+                const img = tctx.getImageData(0, 0, IMG_SIZE, IMG_SIZE).data;
+                const out = new Float32Array(3 * IMG_SIZE * IMG_SIZE);
 
-                const stride = IMG_SIZE * IMG_SIZE;
-                const data = new Float32Array(N * 3 * stride);
-
-                for (let i = 0; i < N; i++) {
-                    const [x1, y1, x2, y2] = boxes[i];
-                    const w = x2 - x1;
-                    const h = y2 - y1;
-
-                    // Draw crop from the FROZEN bitmap
-                    batchCtx.drawImage(
-                        sourceBitmap,
-                        x1,
-                        y1,
-                        w,
-                        h,
-                        0,
-                        0,
-                        IMG_SIZE,
-                        IMG_SIZE,
-                    );
-
-                    const imgData = batchCtx.getImageData(
-                        0,
-                        0,
-                        IMG_SIZE,
-                        IMG_SIZE,
-                    ).data;
-
-                    // Layout: [Batch, Channel, Row, Col]
-                    let rStart = i * 3 * stride;
-                    let gStart = rStart + stride;
-                    let bStart = gStart + stride;
-
-                    for (let k = 0; k < imgData.length; k += 4) {
-                        data[rStart++] =
-                            (imgData[k] / 255.0 - MEAN[0]) / STD[0];
-                        data[gStart++] =
-                            (imgData[k + 1] / 255.0 - MEAN[1]) / STD[1];
-                        data[bStart++] =
-                            (imgData[k + 2] / 255.0 - MEAN[2]) / STD[2];
-                    }
+                let r = 0,
+                    g = IMG_SIZE * IMG_SIZE,
+                    b = 2 * IMG_SIZE * IMG_SIZE;
+                for (let i = 0; i < img.length; i += 4) {
+                    out[r++] = (img[i] / 255 - mean[0]) / std[0];
+                    out[g++] = (img[i + 1] / 255 - mean[1]) / std[1];
+                    out[b++] = (img[i + 2] / 255 - mean[2]) / std[2];
                 }
-                return new ort.Tensor("float32", data, [
-                    N,
+                return new ort.Tensor("float32", out, [
+                    1,
                     3,
                     IMG_SIZE,
                     IMG_SIZE,
@@ -241,8 +224,12 @@
             }
 
             // =================================================
-            // YOLO Logic
+            // YOLO decode
             // =================================================
+            /**
+             * @param {ort.Tensor} raw
+             * @returns {Array<[number, number, number, number, number]>}
+             */
             function decodeYOLO(raw) {
                 const arr = raw.data;
                 const stride = 6300;
@@ -265,18 +252,29 @@
                 return out;
             }
 
+            /**
+             * @param {number[]} a
+             * @param {number[]} b
+             * @returns {number}
+             */
             function iou(a, b) {
                 const x1 = Math.max(a[0], b[0]),
-                    y1 = Math.max(a[1], b[1]);
-                const x2 = Math.min(a[2], b[2]),
-                    y2 = Math.min(a[3], b[3]);
-                const inter = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+                    y1 = Math.max(a[1], b[1]),
+                    x2 = Math.min(a[2], b[2]),
+                    y2 = Math.min(a[3], b[3]),
+                    w = Math.max(0, x2 - x1),
+                    h = Math.max(0, y2 - y1),
+                    inter = w * h;
                 if (!inter) return 0;
                 const areaA = (a[2] - a[0]) * (a[3] - a[1]);
                 const areaB = (b[2] - b[0]) * (b[3] - b[1]);
                 return inter / (areaA + areaB - inter);
             }
 
+            /**
+             * @param {Array<[number, number, number, number, number]>} boxes
+             * @returns {Array<[number, number, number, number, number]>}
+             */
             function nms(boxes) {
                 boxes.sort((a, b) => b[4] - a[4]);
                 const keep = [];
@@ -288,12 +286,32 @@
                 return keep;
             }
 
-            // =================================================
-            // Set Game Logic
-            // =================================================
+            /**
+             * @param {Float32Array|number[]} a
+             * @returns {number}
+             */
+            function argmax(a) {
+                let m = 0;
+                for (let i = 1; i < a.length; i++) if (a[i] > a[m]) m = i;
+                return m;
+            }
+
+            // SET rules
+            /**
+             * @param {string|number} a
+             * @param {string|number} b
+             * @param {string|number} c
+             * @returns {boolean}
+             */
             function attrOK(a, b, c) {
                 return (a === b && b === c) || (a !== b && a !== c && b !== c);
             }
+            /**
+             * @param {{color:string;shape:string;fill:string;count:string}} a
+             * @param {{color:string;shape:string;fill:string;count:string}} b
+             * @param {{color:string;shape:string;fill:string;count:string}} c
+             * @returns {boolean}
+             */
             function isSet(a, b, c) {
                 return (
                     attrOK(a.color, b.color, c.color) &&
@@ -302,12 +320,15 @@
                     attrOK(a.count, b.count, c.count)
                 );
             }
+            /**
+             * @param {{attrs:{color:string;shape:string;fill:string;count:string}}[]} cards
+             * @returns {number[][]}
+             */
             function findSets(cards) {
                 const out = [];
-                const n = cards.length;
-                for (let i = 0; i < n; i++)
-                    for (let j = i + 1; j < n; j++)
-                        for (let k = j + 1; k < n; k++)
+                for (let i = 0; i < cards.length; i++)
+                    for (let j = i + 1; j < cards.length; j++)
+                        for (let k = j + 1; k < cards.length; k++)
                             if (
                                 isSet(
                                     cards[i].attrs,
@@ -320,196 +341,166 @@
             }
 
             // =================================================
-            // Main Loop
+            // Main Loop (only when NOT paused)
             // =================================================
             async function loop() {
                 requestAnimationFrame(loop);
                 if (paused) return;
 
+                // show live video
                 ctx.drawImage(video, 0, 0, YOLO_W, YOLO_H);
 
                 if (!isProcessing) {
-                    isProcessing = true;
-                    // Capture raw data
+                    // capture the current frame as ImageData
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
-
-                    // Create bitmap for cropping (Async)
-                    createImageBitmap(capturedImage)
-                        .then((bitmap) => {
-                            processFrame(capturedImage, bitmap);
-                        })
-                        .catch((e) => {
-                            console.error("Bitmap error:", e);
-                            isProcessing = false;
-                        });
+                    // fire and forget; do not await to keep UI responsive
+                    void processFrame(capturedImage);
                 }
             }
 
-            uploadBtn.onchange = function () {
+            // =================================================
+            // Manual Upload
+            // =================================================
+            uploadBtn.onchange = async function (e) {
                 const file = this.files && this.files[0];
-                if (!file) return;
-
-                // Prevent interrupting if busy to avoid crash
-                if (isProcessing) {
-                    console.warn("Processing in progress, wait a moment...");
-                    // Optionally could handle a retry here, but safe exit is better
+                if (!file) {
+                    return;
                 }
 
-                paused = true; // Stop the camera loop
+                // Stop the loop BEFORE drawing, or video will overwrite the canvas
+                paused = true;
                 video.style.display = "none";
                 canvas.style.display = "block";
 
                 const img = new Image();
                 img.onload = () => {
-                    // Draw image to canvas
+                    // hard-stop video immediately
+                    isProcessing = false; // cancel any pending processing
+                    capturedImage = null;
                     ctx.drawImage(img, 0, 0, YOLO_W, YOLO_H);
 
-                    // Capture data
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
 
-                    // Lock and Process
-                    isProcessing = true;
-                    createImageBitmap(capturedImage)
-                        .then((bitmap) => {
-                            processFrame(capturedImage, bitmap);
-                        })
-                        .catch((e) => {
-                            console.error(e);
-                            isProcessing = false;
-                        });
+                    processFrame(capturedImage);
                 };
+
                 img.src = URL.createObjectURL(file);
             };
 
             // =================================================
-            // Process Frame
+            // Process a single frame (stateless)
             // =================================================
-            async function processFrame(imageData, sourceBitmap) {
-                try {
-                    // 1. YOLO Inference
-                    const t0 = performance.now();
-                    const yIn = preprocessYOLO_fromImageData(imageData);
+            /**
+             * @param {ImageData} imageData
+             */
+            async function processFrame(imageData) {
+                isProcessing = true;
 
-                    const yOut = await yoloSession.run({
-                        [yoloSession.inputNames[0]]: yIn,
+                // YOLO
+                const t0 = performance.now();
+                const yIn = preprocessYOLO_fromImageData(imageData);
+                const yOut = await yoloSession.run({
+                    [yoloSession.inputNames[0]]: yIn,
+                });
+                const dets = nms(decodeYOLO(yOut[yoloSession.outputNames[0]]));
+                tSeg = performance.now() - t0;
+
+                // Classification
+                const cards = [];
+                const t1 = performance.now();
+
+                for (const [x1, y1, x2, y2, conf] of dets) {
+                    const x1c = Math.max(0, Math.min(YOLO_W - 1, x1));
+                    const y1c = Math.max(0, Math.min(YOLO_H - 1, y1));
+                    const x2c = Math.max(0, Math.min(YOLO_W - 1, x2));
+                    const y2c = Math.max(0, Math.min(YOLO_H - 1, y2));
+
+                    const w = x2c - x1c;
+                    const h = y2c - y1c;
+                    if (w < 5 || h < 5) continue;
+
+                    cropCanvas.width = w;
+                    cropCanvas.height = h;
+                    cropCtx.drawImage(canvas, x1c, y1c, w, h, 0, 0, w, h);
+                    // cropCtx.putImageData(imageData, -x1, -y1);
+
+                    const clfIn = preprocessClassifier(w, h);
+                    const out = await clfSession.run({
+                        [clfSession.inputNames[0]]: clfIn,
                     });
 
-                    const dets = nms(
-                        decodeYOLO(yOut[yoloSession.outputNames[0]]),
-                    );
-                    tSeg = performance.now() - t0;
-
-                    // Filter boxes
-                    const validDets = [];
-                    for (const box of dets) {
-                        const [x1, y1, x2, y2] = box;
-                        const x1c = Math.max(0, Math.min(YOLO_W - 1, x1));
-                        const y1c = Math.max(0, Math.min(YOLO_H - 1, y1));
-                        const x2c = Math.max(0, Math.min(YOLO_W - 1, x2));
-                        const y2c = Math.max(0, Math.min(YOLO_H - 1, y2));
-                        // Ensure crop is at least 10x10
-                        if (x2c - x1c > 10 && y2c - y1c > 10) {
-                            validDets.push([x1c, y1c, x2c, y2c]);
-                        }
-                    }
-
-                    const cards = [];
-                    let t1 = performance.now();
-
-                    if (validDets.length > 0) {
-                        // 2. Batched Classification
-                        // Pass the frozen sourceBitmap to ensure pixel consistency
-                        const batchTensor = preprocessBatch(
-                            validDets,
-                            sourceBitmap,
-                        );
-
-                        const clfResults = await clfSession.run({
-                            [clfSession.inputNames[0]]: batchTensor,
-                        });
-
-                        const N = validDets.length;
-                        const colorData = clfResults.color.data;
-                        const shapeData = clfResults.shape.data;
-                        const fillData = clfResults.fill.data;
-                        const countData = clfResults.count.data;
-
-                        for (let i = 0; i < N; i++) {
-                            cards.push({
-                                box: validDets[i],
-                                attrs: {
-                                    color: COLORS[
-                                        argmaxOffset(colorData, i * 3, 3)
-                                    ],
-                                    shape: SHAPES[
-                                        argmaxOffset(shapeData, i * 3, 3)
-                                    ],
-                                    fill: FILLS[
-                                        argmaxOffset(fillData, i * 3, 3)
-                                    ],
-                                    count: COUNTS[
-                                        argmaxOffset(countData, i * 3, 3)
-                                    ],
-                                },
-                            });
-                        }
-                    }
-                    tClf = performance.now() - t1;
-
-                    // 3. Set Logic
-                    const t2 = performance.now();
-                    const sets = findSets(cards);
-                    tSet = performance.now() - t2;
-
-                    lastDetections = cards;
-                    lastSets = sets;
-
-                    if (sets.length > 0) {
-                        paused = true;
-                        lastFoundSet = sets[0];
-                        renderFrozenResults();
-                        nextBtn.style.display = "block";
-                    }
-                } catch (err) {
-                    console.error("Processing Error Details:", err);
-                    // Display full error on screen
-                    perfBox.textContent = "Error: " + (err.message || err);
-                } finally {
-                    if (sourceBitmap) sourceBitmap.close();
-                    isProcessing = false;
+                    cards.push({
+                        box: [x1, y1, x2, y2],
+                        attrs: {
+                            color: COLORS[argmax(out.color.data)],
+                            shape: SHAPES[argmax(out.shape.data)],
+                            fill: FILLS[argmax(out.fill.data)],
+                            count: COUNTS[argmax(out.count.data)],
+                        },
+                    });
                 }
+
+                tClf = performance.now() - t1;
+
+                // Sets
+                const t2 = performance.now();
+                const sets = findSets(cards);
+                tSet = performance.now() - t2;
+
+                lastDetections = cards;
+                lastSets = sets;
+
+                if (sets.length > 0) {
+                    paused = true;
+                    lastFoundSet = sets[0];
+                    renderFrozenResults();
+                    nextBtn.style.display = "block";
+                }
+
+                isProcessing = false;
             }
 
+            // =================================================
+            // Draw results using capturedImage
+            // =================================================
             function renderFrozenResults() {
-                if (!capturedImage) return;
+                if (!capturedImage) {
+                    return;
+                }
                 video.style.display = "none";
                 canvas.style.display = "block";
+
                 ctx.putImageData(capturedImage, 0, 0);
 
+                // draw all detections
                 ctx.strokeStyle = "white";
                 ctx.lineWidth = 2;
+
                 lastDetections.forEach((c, i) => {
                     const [x1, y1, x2, y2] = c.box;
                     ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+                    // draw card index in center
                     const cx = (x1 + x2) / 2;
                     const cy = (y1 + y2) / 2;
                     drawCenteredText(i + 1, cx, cy);
                 });
 
-                if (lastFoundSet) {
-                    ctx.strokeStyle = "#00ff00";
-                    ctx.lineWidth = 6;
-                    lastFoundSet.forEach((idx) => {
-                        const [x1, y1, x2, y2] = lastDetections[idx].box;
-                        ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-                    });
-                }
+                // highlight set
+                ctx.strokeStyle = "green";
+                ctx.lineWidth = 5;
+                lastFoundSet.forEach((idx) => {
+                    const [x1, y1, x2, y2] = lastDetections[idx].box;
+                    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+                });
 
+                // Perf
                 perfBox.textContent =
                     `seg: ${tSeg.toFixed(1)}ms, ` +
-                    `clf: ${tClf.toFixed(1)}ms (n=${lastDetections.length}), ` +
+                    `clf: ${tClf.toFixed(1)}ms, ` +
                     `set: ${tSet.toFixed(1)}ms`;
 
+                // captions
                 const cardLines = lastDetections.map((c, i) => {
                     const a = c.attrs;
                     return `Card ${i + 1}: ${a.count} ${a.color} ${a.shape} ${a.fill}`;
@@ -517,12 +508,16 @@
                 const setLines = lastSets.map(
                     (s, i) => `Set ${i + 1}: ${s.map((x) => x + 1).join(", ")}`,
                 );
+
                 document.getElementById("cardList").textContent = [
                     ...cardLines,
                     ...setLines,
                 ].join("\n");
             }
 
+            // =================================================
+            // Continue Button
+            // =================================================
             nextBtn.onclick = () => {
                 paused = false;
                 nextBtn.style.display = "none";
@@ -531,43 +526,39 @@
             };
 
             async function init() {
-                try {
-                    if (!("mediaDevices" in navigator))
-                        throw new Error("No Camera API");
-
-                    const stream = await navigator.mediaDevices.getUserMedia({
-                        video: {
-                            facingMode: { ideal: "environment" },
-                            width: { ideal: YOLO_W },
-                            height: { ideal: YOLO_H },
-                        },
-                    });
-                    video.srcObject = stream;
-
-                    // Load Models with Optimization Enabled
-                    yoloSession = await ort.InferenceSession.create(
-                        "segmentationv3.onnx",
-                        {
-                            executionProviders: ["webgpu"],
-                            graphOptimizationLevel: "all",
-                        },
-                    );
-                    clfSession = await ort.InferenceSession.create(
-                        "classificationv3.onnx",
-                        {
-                            executionProviders: ["webgpu"],
-                            graphOptimizationLevel: "all",
-                        },
-                    );
-
+                if (!("mediaDevices" in navigator)) {
                     document.getElementById("status").textContent =
-                        "Models Ready (Batching + WebGPU).";
-                    requestAnimationFrame(loop);
-                } catch (e) {
-                    console.error(e);
-                    document.getElementById("status").textContent =
-                        "Init Error: " + e.message;
+                        "Camera API not available in this browser.";
+                    return;
                 }
+
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: { ideal: "environment" },
+                        width: { ideal: YOLO_W },
+                        height: { ideal: YOLO_H },
+                    },
+                });
+                video.srcObject = stream;
+
+                yoloSession = await ort.InferenceSession.create(
+                    "segmentationv3.onnx",
+                    {
+                        executionProviders: ["webgpu"],
+                        graphOptimizationLevel: "all",
+                    },
+                );
+                clfSession = await ort.InferenceSession.create(
+                    "classificationv3.onnx",
+                    {
+                        executionProviders: ["webgpu"],
+                        graphOptimizationLevel: "all",
+                    },
+                );
+
+                document.getElementById("status").textContent =
+                    "Models loaded.";
+                requestAnimationFrame(loop);
             }
 
             init();
