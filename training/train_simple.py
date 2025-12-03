@@ -48,8 +48,9 @@ import torch
 import torch.nn as nn
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 from svgpathtools import parse_path
+from timm.utils import ModelEmaV2
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision import transforms
 
@@ -68,29 +69,23 @@ SHAPES = ["diamond", "oval", "squiggle"]
 FILLS = ["solid", "striped", "empty"]
 COUNTS = ["one", "two", "three"]
 
+
 RGB_MAP = {
     "red": [
-        (235, 30, 35),  # Brighter Red
+        (235, 30, 35),
         (215, 45, 45),
+        (180, 20, 20),  # Dark Red (Underexposed)
     ],
     "green": [
-        (50, 205, 50),  # Lime Green
+        (50, 205, 50),
         (60, 190, 60),
         (80, 210, 80),
-        (30, 100, 35),
-        # (30, 180, 50),
+        (30, 100, 35),  # Dark/Thin Green
     ],
     "purple": [
-        # (75, 40, 140),
-        # (60, 30, 120),
-        # (90, 50, 160),
-        (60, 25, 140),  # Deep Blue-Violet
+        (60, 25, 140),
         (75, 35, 150),
         (55, 20, 120),
-        # (45, 10, 100),  # Deep Indigo
-        # (60, 20, 120),  # Dark Violet
-        # (55, 15, 110),  # Mid Blue-Purple
-        # (40, 10, 90),  # Very dark
     ],
 }
 
@@ -374,31 +369,6 @@ class SyntheticCardDataset(Dataset):
         )
 
     # --------------------------------------------------------
-    # Directional light
-    # --------------------------------------------------------
-    def _directional_light(self, img):
-        arr = np.array(img).astype(np.float32)
-        h, w, _ = arr.shape
-
-        # Random light direction: angle 0–360 deg
-        angle = random.uniform(0, 2 * np.pi)
-        dx = np.cos(angle)
-        dy = np.sin(angle)
-
-        # Create linear light gradient
-        Y, X = np.mgrid[0:h, 0:w]
-        norm = X * dx + Y * dy
-        norm = (norm - norm.min()) / (norm.max() - norm.min())
-
-        # Strength: subtle 5–15%
-        strength = random.uniform(0.05, 0.15)
-        lightmap = 1 + (norm - 0.5) * strength
-
-        arr = arr * lightmap[..., None]
-        arr = np.clip(arr, 0, 255).astype(np.uint8)
-        return Image.fromarray(arr)
-
-    # --------------------------------------------------------
     # Camera imperfections
     # --------------------------------------------------------
     def _camera_artifacts(self, img):
@@ -420,8 +390,27 @@ class SyntheticCardDataset(Dataset):
 
         return img
 
+    def _add_glare(self, img):
+        if random.random() > 0.4:
+            return img
+        w, h = img.size
+        glare = Image.new("L", (w, h), 0)
+        draw = ImageDraw.Draw(glare)
+        for _ in range(random.randint(1, 2)):
+            x = random.randint(0, w)
+            y = random.randint(0, h)
+            r = random.randint(w // 6, w // 3)
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=random.randint(50, 180))
+        glare = glare.filter(ImageFilter.GaussianBlur(radius=random.uniform(10, 20)))
+        img_arr = np.array(img).astype(np.float32)
+        glare_arr = np.array(glare).astype(np.float32) / 255.0
+        for c in range(3):
+            img_arr[..., c] += glare_arr * 255.0 * 0.6
+        img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(img_arr)
+
     # ------------------------------------------------------------
-    # Draw a single shape with matplotlib (same logic you had)
+    # Draw a single shape
     # ------------------------------------------------------------
     def _draw_shape(self, ax, shape, fill_type, rgb, rect):
         x1, y1, x2, y2 = rect
@@ -429,7 +418,14 @@ class SyntheticCardDataset(Dataset):
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         color = tuple(c / 255 for c in rgb)
         face = color if fill_type == "solid" else (0, 0, 0, 0)
-        linewidth = random.uniform(0.3, 1)
+
+        # Variable line width
+        if fill_type == "empty":
+            linewidth = random.uniform(0.8, 2.5)
+        elif fill_type == "striped":
+            linewidth = random.uniform(0.5, 1.5)
+        else:
+            linewidth = 0.5
 
         if shape == "oval":
             patch = patches.FancyBboxPatch(
@@ -446,7 +442,7 @@ class SyntheticCardDataset(Dataset):
             patch = patches.Polygon(
                 verts, closed=True, edgecolor=color, facecolor=face, linewidth=linewidth
             )
-        else:  # squiggle
+        else:
             path = _build_squiggle_path_in_rect(x1, y1, x2, y2)
             patch = patches.PathPatch(
                 path, edgecolor=color, facecolor=face, linewidth=linewidth
@@ -455,13 +451,26 @@ class SyntheticCardDataset(Dataset):
         ax.add_patch(patch)
 
         if fill_type == "striped":
-            spacing = random.uniform(1.2, 2.5)
-            for x in np.arange(x1 - 10, x2 + 10, spacing):
+            # Angled stripes
+            spacing = random.uniform(1.8, 3)
+            angle_deg = random.uniform(-20, 20)
+            angle_rad = np.radians(angle_deg)
+            diameter = np.sqrt(w**2 + h**2) * 1.5
+            num_lines = int(diameter / spacing)
+            offsets = np.arange(-num_lines // 2, num_lines // 2) * spacing
+            cos_a = np.cos(angle_rad)
+            sin_a = np.sin(angle_rad)
+
+            for offset in offsets:
+                lx1 = offset * cos_a - (-diameter / 2) * sin_a
+                ly1 = offset * sin_a + (-diameter / 2) * cos_a
+                lx2 = offset * cos_a - (diameter / 2) * sin_a
+                ly2 = offset * sin_a + (diameter / 2) * cos_a
                 ax.plot(
-                    [x, x],
-                    [y1 - 5, y2 + 5],
+                    [cx + lx1, cx + lx2],
+                    [cy + ly1, cy + ly2],
                     color=color,
-                    linewidth=0.3,
+                    linewidth=0.7,
                     clip_path=patch,
                 )
 
@@ -532,6 +541,7 @@ class SyntheticCardDataset(Dataset):
         if random.random() < 0.3:
             img = uneven_tint(img)
 
+        img = self._add_glare(img)
         # --------------------------------------------
         # Background
         # --------------------------------------------
@@ -767,6 +777,8 @@ def train_classifier(
     synth_loader = DataLoader(synth_pretrain, batch_size=batch_size, shuffle=True)
 
     model = CardClassifier(freeze_backbone=True).to(device)
+    # EMA Setup
+    model_ema = ModelEmaV2(model, decay=0.995)
 
     # --------------------------------------
     # Learning rate scheduling (warmup + cosine)
@@ -798,19 +810,33 @@ def train_classifier(
         return loss
 
     def validate():
-        model.eval()
-        correct = [0, 0, 0, 0]
+        test_model = model_ema.module
+        test_model.eval()
+        correct_attrs = [0, 0, 0, 0]
+        perfect_cards = 0
         total = 0
         with torch.no_grad():
             for imgs, targs in val_loader:
                 imgs, targs = imgs.to(device), targs.to(device)
-                outs = model(imgs)
+                outs = test_model(imgs)
+
+                # Stack predictions: Tuple of 4x(B, 3) -> Tensor (B, 4)
+                preds = torch.stack([out.argmax(dim=1) for out in outs], dim=1)
+
+                # Stack targets: Tensor (B, 4, 3) -> Tensor (B, 4)
+                # We simply argmax the one-hot encoding at the last dimension
+                trues = targs.argmax(dim=2)
+
+                # Check individual attributes
                 for i in range(4):
-                    pred = outs[i].argmax(dim=1)
-                    true = targs[:, i].argmax(dim=1)
-                    correct[i] += (pred == true).sum().item()
+                    correct_attrs[i] += (preds[:, i] == trues[:, i]).sum().item()
+
+                # Check perfect matches (rows where all columns match)
+                perfect_match = (preds == trues).all(dim=1)
+                perfect_cards += perfect_match.sum().item()
+
                 total += imgs.size(0)
-        return [c / total * 100 for c in correct]
+        return [c / total * 100 for c in correct_attrs], perfect_cards / total * 100
 
     Path("runs").mkdir(exist_ok=True)
     best_acc = 0
@@ -827,27 +853,18 @@ def train_classifier(
             loss = calc_loss(outs, targs)
             loss.backward()
             optimizer.step()
+            model_ema.update(model)
             scheduler.step()
             total_loss += loss.item()
-
-        accs = validate()
-        avg_acc = sum(accs) / 4
+        accs, joint = validate()
         print(
-            f"Epoch {epoch + 1}/{epochs_pretrain} - Loss: {total_loss / len(synth_loader):.3f} - "
-            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
+            f"Epoch {epoch + 1} - Loss: {total_loss / len(synth_loader):.3f} - Val: C={accs[0]:.1f}% (Joint Perfect={joint:.1f}%)"
         )
 
     # Phase 2: Finetune on mixed real + synthetic
     print(f"\n=== Phase 2: Mixed Finetuning ({epochs_finetune} epochs) ===")
     mixed_ds = ConcatDataset(
-        [
-            real_train_ds,
-            real_train_ds,
-            real_train_ds,
-            real_train_ds,
-            real_train_ds,
-            SyntheticCardDataset(length=1000, img_size=IMG_SIZE),
-        ]
+        [real_train_ds] * 5 + [SyntheticCardDataset(length=1000, img_size=IMG_SIZE)]
     )
     mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
 
@@ -876,21 +893,20 @@ def train_classifier(
             loss = calc_loss(outs, targs, finetuning=True)
             loss.backward()
             optimizer.step()
+            model_ema.update(model)
             scheduler.step()
             total_loss += loss.item()
 
-        accs = validate()
-        avg_acc = reduce(mul, accs) / (100**3)
+        accs, joint = validate()
         print(
-            f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader):.3f} - "
-            f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
+            f"Epoch {epoch + 1} - Loss: {total_loss / len(mixed_loader):.3f} - Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (Joint Perfect={joint:.1f}%)"
         )
 
-        if avg_acc > best_acc:
-            best_acc = avg_acc
-            torch.save(model.state_dict(), "runs/card_classifier_best.pt")
+        if joint > best_acc:
+            best_acc = joint
+            torch.save(model_ema.module.state_dict(), "runs/card_classifier_best.pt")
 
-    torch.save(model.state_dict(), "runs/card_classifier.pt")
+    torch.save(model_ema.module.state_dict(), "runs/card_classifier.pt")
     print(f"\nTraining complete. Best accuracy: {best_acc:.1f}%")
 
 
