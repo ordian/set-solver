@@ -34,6 +34,7 @@ import colorsys
 import io
 import json
 import random
+import shutil
 import sys
 from functools import reduce
 from operator import mul
@@ -47,7 +48,7 @@ import torch
 import torch.nn as nn
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.figure import Figure
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 from svgpathtools import parse_path
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 from torchvision import transforms
@@ -59,7 +60,8 @@ from torchvision import transforms
 # ============================================
 DATASET_DIR = Path("dataset")
 # IMG_SIZE = 224
-IMG_SIZE = 112
+# IMG_SIZE = 112
+IMG_SIZE = 160
 
 COLORS = ["red", "green", "purple"]
 SHAPES = ["diamond", "oval", "squiggle"]
@@ -68,19 +70,23 @@ COUNTS = ["one", "two", "three"]
 
 RGB_MAP = {
     "red": [
-        (200, 40, 30),
-        (225, 55, 45),
-        (175, 30, 20),
+        (235, 30, 35),  # Brighter Red
+        (215, 45, 45),
     ],
     "green": [
-        (70, 150, 60),
-        (95, 170, 75),
-        (120, 190, 90),
+        (50, 205, 50),  # Lime Green
+        (60, 190, 60),
+        (80, 210, 80),
+        (30, 100, 35),
+        # (30, 180, 50),
     ],
     "purple": [
-        (75, 40, 140),
-        (60, 30, 120),
-        (90, 50, 160),
+        # (75, 40, 140),
+        # (60, 30, 120),
+        # (90, 50, 160),
+        (60, 25, 140),  # Deep Blue-Violet
+        (75, 35, 150),
+        (55, 20, 120),
         # (45, 10, 100),  # Deep Indigo
         # (60, 20, 120),  # Dark Violet
         # (55, 15, 110),  # Mid Blue-Purple
@@ -423,7 +429,7 @@ class SyntheticCardDataset(Dataset):
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
         color = tuple(c / 255 for c in rgb)
         face = color if fill_type == "solid" else (0, 0, 0, 0)
-        linewidth = 0.9
+        linewidth = random.uniform(0.3, 1)
 
         if shape == "oval":
             patch = patches.FancyBboxPatch(
@@ -449,7 +455,7 @@ class SyntheticCardDataset(Dataset):
         ax.add_patch(patch)
 
         if fill_type == "striped":
-            spacing = random.uniform(1.5, 3.0)
+            spacing = random.uniform(1.2, 2.5)
             for x in np.arange(x1 - 10, x2 + 10, spacing):
                 ax.plot(
                     [x, x],
@@ -636,8 +642,6 @@ class CardClassifier(nn.Module):
             # global_pool="",
         )
 
-        # feats_dim = 384
-        shared_dim = 128
         with torch.no_grad():
             dummy = torch.zeros(1, 3, IMG_SIZE, IMG_SIZE)
             self.backbone.eval()
@@ -647,13 +651,22 @@ class CardClassifier(nn.Module):
         # ------------------------------------------------
         # SHARED MLP for shape/fill/count
         # ------------------------------------------------
+        shared_dim = 256
         self.hidden = nn.Sequential(
             nn.Dropout(0.2),
             nn.Linear(feats_dim, shared_dim),
             nn.Hardswish(),  # Faster/better than ReLU in MobileNets
+            nn.Dropout(0.2),
         )
 
-        self.head_color = nn.Sequential(nn.Dropout(0.2), nn.Linear(feats_dim, 3))
+        color_hidden = 128
+        self.head_color = nn.Sequential(
+            nn.Dropout(0.2),
+            nn.Linear(feats_dim, color_hidden),
+            nn.Hardswish(),
+            nn.Dropout(0.2),
+            nn.Linear(color_hidden, 3),
+        )
         self.head_shape = nn.Linear(shared_dim, 3)
         self.head_fill = nn.Linear(shared_dim, 3)
         self.head_count = nn.Linear(shared_dim, 3)
@@ -684,7 +697,7 @@ class CardClassifier(nn.Module):
 # Training
 # ============================================
 def train_classifier(
-    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 32
+    epochs_pretrain: int = 5, epochs_finetune: int = 15, batch_size: int = 64
 ):
     """Train classifier with synthetic pretrain + real finetune."""
 
@@ -705,10 +718,11 @@ def train_classifier(
                 (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
             ),
             transforms.ColorJitter(
-                brightness=0.3, contrast=0.3, saturation=0.3, hue=0.01
+                brightness=0.3, contrast=0.3, saturation=0.5, hue=0.005
             ),
+            transforms.RandomGrayscale(p=0.05),
             transforms.RandomRotation(15),
-            transforms.RandomPerspective(distortion_scale=0.1, p=0.3),
+            transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
             transforms.ToTensor(),
             # transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2]),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -731,7 +745,9 @@ def train_classifier(
         all_labels = json.load(f)
 
     all_images = list(all_labels.keys())
-    train_size = int(0.8 * len(all_images))
+    random.seed(42)
+    random.shuffle(all_images)
+    train_size = int(0.7 * len(all_images))
 
     train_labels = {k: all_labels[k] for k in all_images[:train_size]}
     val_labels = {k: all_labels[k] for k in all_images[train_size:]}
@@ -828,6 +844,8 @@ def train_classifier(
             real_train_ds,
             real_train_ds,
             real_train_ds,
+            real_train_ds,
+            real_train_ds,
             SyntheticCardDataset(length=1000, img_size=IMG_SIZE),
         ]
     )
@@ -862,7 +880,7 @@ def train_classifier(
             total_loss += loss.item()
 
         accs = validate()
-        avg_acc = sum(accs) / len(accs)
+        avg_acc = reduce(mul, accs) / (100**3)
         print(
             f"Epoch {epoch + 1}/{epochs_finetune} - Loss: {total_loss / len(mixed_loader):.3f} - "
             f"Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (avg={avg_acc:.1f}%)"
@@ -1022,6 +1040,173 @@ def test(image_path: str):
     output_path = Path(image_path).stem + "_annotated.jpg"
     img.save(output_path)
     print(f"\nAnnotated image saved: {output_path}")
+
+
+def analyze_failures(model_path="runs/card_classifier_best.pt"):
+    from torchvision.utils import save_image
+
+    device = "mps" if torch.mps.is_available() else "cpu"
+    # Re-instantiate model structure
+    model = CardClassifier(freeze_backbone=False)
+    model.load_state_dict(
+        torch.load(model_path, map_location=device, weights_only=True)
+    )
+    model.eval().to(device)
+
+    # Load Val Data
+    labels_path = DATASET_DIR / "classifier" / "labels_val.json"
+    val_ds = RealCardDataset(
+        DATASET_DIR / "classifier" / "crops",
+        labels_path,
+        transform=transforms.Compose(
+            [
+                transforms.Resize((IMG_SIZE, IMG_SIZE)),  # Ensure this matches training
+                transforms.ToTensor(),
+                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+            ]
+        ),
+    )
+
+    failures = []
+    print(f"Analyzing {len(val_ds)} validation images...")
+
+    with torch.no_grad():
+        for i in range(len(val_ds)):
+            img, targ = val_ds[i]
+            img = img.to(device).unsqueeze(0)
+
+            c, s, f, n = model(img)
+
+            pred_c = c.argmax().item()
+            pred_f = f.argmax().item()
+
+            true_c = targ[0].argmax().item()
+            true_f = targ[2].argmax().item()
+
+            # Check for Color or Fill errors
+            if pred_c != true_c or pred_f != true_f:
+                # Un-normalize for saving
+                inv_img = (
+                    img.cpu().squeeze(0)
+                    * torch.tensor([0.229, 0.224, 0.225])[:, None, None]
+                    + torch.tensor([0.485, 0.456, 0.406])[:, None, None]
+                )
+                failures.append(inv_img)
+                print(
+                    f"Fail {i}: True(C={COLORS[true_c]}, F={FILLS[true_f]}) vs Pred(C={COLORS[pred_c]}, F={FILLS[pred_f]})"
+                )
+
+    if failures:
+        # Save top 64 failures to a grid
+        stack = torch.stack(failures[:64])
+        save_image(stack, "runs/failures.jpg", nrow=8)
+        print(f"Saved {len(failures)} failures to runs/failures.jpg")
+    else:
+        print("No failures found!")
+
+
+# ============================================
+# Data Cleaning Tools
+# ============================================
+def find_label_errors(model_path="runs/card_classifier_best.pt"):
+    """
+    1. Runs inference on ALL real crops.
+    2. If Prediction != Label, saves image to 'suspicious_labels/'
+    3. User reviews the folder, deleting images where the MODEL was wrong.
+    """
+    import shutil
+
+    # Setup paths
+    labels_path = DATASET_DIR / "classifier" / "labels.json"
+    crops_dir = DATASET_DIR / "classifier" / "crops"
+    out_dir = Path("suspicious_labels")
+
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir()
+
+    # Load Model
+    device = "mps" if torch.mps.is_available() else "cpu"
+    print(f"Loading model from {model_path} on {device}...")
+    model = CardClassifier(freeze_backbone=False)
+    model.load_state_dict(
+        torch.load(model_path, map_location=device, weights_only=True)
+    )
+    model.eval().to(device)
+
+    # Transform (Standard validation transform)
+    # Note: Use 160 or 128 depending on what you trained with last
+    val_transform = transforms.Compose(
+        [
+            transforms.Resize(
+                (160, 160), interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # Load all labels
+    with open(labels_path) as f:
+        all_labels = json.load(f)
+
+    print(f"Checking {len(all_labels)} images for mismatches...")
+
+    mismatch_count = 0
+
+    for filename, label in all_labels.items():
+        img_path = crops_dir / filename
+        if not img_path.exists():
+            continue
+
+        # Load and Predict
+        pil_img = Image.open(img_path).convert("RGB")
+        img_t = val_transform(pil_img).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            c, s, f, n = model(img_t)
+
+        pred_color = COLORS[c.argmax().item()]
+        pred_shape = SHAPES[s.argmax().item()]
+        pred_fill = FILLS[f.argmax().item()]
+        pred_count = COUNTS[n.argmax().item()]
+
+        # Compare
+        is_mismatch = False
+        mismatch_str = []
+
+        if pred_color != label["color"]:
+            is_mismatch = True
+            mismatch_str.append(f"C_{label['color']}->{pred_color}")
+        if pred_shape != label["shape"]:
+            is_mismatch = True
+            mismatch_str.append(f"S_{label['shape']}->{pred_shape}")
+        if pred_fill != label["fill"]:
+            is_mismatch = True
+            mismatch_str.append(f"F_{label['fill']}->{pred_fill}")
+        if pred_count != label["count"]:
+            is_mismatch = True
+            mismatch_str.append(f"N_{label['count']}->{pred_count}")
+
+        if is_mismatch:
+            mismatch_count += 1
+            # Save file with details in name for easy review
+            # Format: originalname___Diffs.jpg
+            diff_text = "__".join(mismatch_str)
+            save_name = f"{Path(filename).stem}___{diff_text}.jpg"
+            pil_img.save(out_dir / save_name)
+
+    print(f"\nFound {mismatch_count} mismatches.")
+    print(f"1. Open the '{out_dir}' folder.")
+    print(
+        f"2. View the images. The filename tells you the change: e.g., 'C_red->purple'."
+    )
+    print(f"   (This means Label was Red, Model thinks Purple)")
+    print(
+        f"3. If the MODEL is WRONG (the label was actually correct), DELETE the file."
+    )
+    print(f"4. If the MODEL is RIGHT (the label was wrong), KEEP the file.")
+    print(f"5. Run 'uv run train_simple.py fix-labels' to apply the changes.")
 
 
 def test_onnx(image_path: str):
@@ -1250,9 +1435,76 @@ def export():
                 init.data_location = onnx.TensorProto.DEFAULT
                 init.raw_data = array.tobytes()
 
-        onnx.save(model, "runs/card_classifier_lcnet_v2.onnx")
+        onnx.save(model, "runs/card_classifier_mn4s_v2.onnx")
 
         print(f"Classifier exported: runs/card_classifier.onnx")
+
+
+def fix_labels():
+    """
+    Reads the remaining files in 'suspicious_labels/' and updates labels.json.
+    """
+    suspicious_dir = Path("suspicious_labels")
+    labels_path = DATASET_DIR / "classifier" / "labels.json"
+
+    if not suspicious_dir.exists():
+        print("No suspicious_labels folder found.")
+        return
+
+    with open(labels_path) as f:
+        data = json.load(f)
+
+    # Parse filenames in folder
+    files = list(suspicious_dir.glob("*.jpg"))
+    if not files:
+        print("No files in suspicious_labels/. Nothing to fix.")
+        return
+
+    fixed_count = 0
+    for file_path in files:
+        # Extract original filename and changes
+        # Name format: card_0123___C_red->purple__F_solid->striped.jpg
+        name_parts = file_path.stem.split("___")
+        original_stem = name_parts[0]
+        original_filename = original_stem + ".jpg"  # Assuming .jpg extension
+
+        changes = name_parts[1].split("__")
+
+        if original_filename not in data:
+            print(f"Warning: {original_filename} not in labels.json")
+            continue
+
+        # Apply changes
+        for change in changes:
+            # Format: Type_Old->New
+            # e.g. C_red->purple
+            attr_code = change[0]
+            val_part = change.split("_")[1]
+            new_val = val_part.split("->")[1]
+
+            if attr_code == "C":
+                data[original_filename]["color"] = new_val
+            elif attr_code == "S":
+                data[original_filename]["shape"] = new_val
+            elif attr_code == "F":
+                data[original_filename]["fill"] = new_val
+            elif attr_code == "N":
+                data[original_filename]["count"] = new_val
+
+        fixed_count += 1
+
+    # Save Backup
+    shutil.copy(labels_path, str(labels_path) + ".bak")
+
+    # Save New
+    with open(labels_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+    print(f"Updated {fixed_count} labels in labels.json!")
+    print(f"Original file backed up to labels.json.bak")
+
+    # Clean up
+    shutil.rmtree(suspicious_dir)
 
 
 # ============================================
@@ -1280,6 +1532,12 @@ if __name__ == "__main__":
         train_classifier(epochs_pt, epochs_ft)
     elif cmd == "export":
         export()
+    elif cmd == "analyze-failures":
+        analyze_failures()
+    elif cmd == "find-errors":
+        find_label_errors()
+    elif cmd == "fix-labels":
+        fix_labels()
     elif cmd == "test":
         if len(sys.argv) < 3:
             print("Usage: uv run train_simple.py test <image.jpg>")
