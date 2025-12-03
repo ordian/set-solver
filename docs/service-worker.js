@@ -7,7 +7,7 @@ const ASSETS = [
   "/icon-192.png",
   "/icon-512.png",
   "/segmentationv2.onnx",
-  "/classification.onnx",
+  "/classificationv3.onnx",
 ];
 
 // Install SW and cache assets

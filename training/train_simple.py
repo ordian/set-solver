@@ -1486,6 +1486,14 @@ def export():
             export_params=True,
             # do_constant_folding=True,
             # keep_initializers_as_inputs=False,
+            # REQUIRED for batches to work
+            dynamic_axes={
+                "image": {0: "batch_size"},
+                "color": {0: "batch_size"},
+                "shape": {0: "batch_size"},
+                "fill": {0: "batch_size"},
+                "count": {0: "batch_size"},
+            },
         )
         import onnx
         from onnx import numpy_helper
