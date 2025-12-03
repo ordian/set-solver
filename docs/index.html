@@ -358,6 +358,10 @@
                     attrOK(a.count, b.count, c.count)
                 );
             }
+            /**
+             * @param {{attrs:{color:string;shape:string;fill:string;count:string}}[]} cards
+             * @returns {number[][]}
+             */
             function findSets(cards) {
                 const out = [];
                 const n = cards.length;
@@ -388,14 +392,21 @@
                 if (!isProcessing) {
                     // Grab image data once
                     capturedImage = ctx.getImageData(0, 0, YOLO_W, YOLO_H);
+                    // fire and forget; do not await to keep UI responsive
                     void processFrame(capturedImage);
                 }
             }
 
-            uploadBtn.onchange = function (e) {
+            // =================================================
+            // Manual Upload
+            // =================================================
+            uploadBtn.onchange = async function (e) {
                 const file = this.files && this.files[0];
-                if (!file) return;
+                if (!file) {
+                    return;
+                }
 
+                // Stop the loop BEFORE drawing, or video will overwrite the canvas
                 paused = true;
                 video.style.display = "none";
                 canvas.style.display = "block";
@@ -412,7 +423,7 @@
             };
 
             // =================================================
-            // Process Frame (Optimized Pipeline)
+            // Process a single frame (stateless)
             // =================================================
             async function processFrame(imageData) {
                 isProcessing = true;
@@ -593,7 +604,7 @@
                         },
                     );
                     clfSession = await ort.InferenceSession.create(
-                        "classificationv2.onnx",
+                        "classificationv3.onnx",
                         {
                             executionProviders: ["webgpu"],
                             graphOptimizationLevel: "all",
