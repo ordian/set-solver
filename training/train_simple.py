@@ -73,19 +73,21 @@ COUNTS = ["one", "two", "three"]
 RGB_MAP = {
     "red": [
         (235, 30, 35),
-        (215, 45, 45),
-        (180, 20, 20),  # Dark Red (Underexposed)
+        (200, 40, 40),
+        (160, 20, 20),  # Dark Red
+        (255, 100, 100),  # Faded Red
     ],
     "green": [
         (50, 205, 50),
-        (60, 190, 60),
-        (80, 210, 80),
-        (30, 100, 35),  # Dark/Thin Green
+        (30, 160, 30),
+        (20, 100, 20),  # Dark Green
+        (100, 200, 100),  # Faded Green
     ],
     "purple": [
         (60, 25, 140),
-        (75, 35, 150),
-        (55, 20, 120),
+        (50, 20, 100),
+        (50, 30, 190),  # <--- High-Blue Purple (To distinguish from Green)
+        (90, 80, 180),  # Faded Purple
     ],
 }
 
@@ -368,6 +370,22 @@ class SyntheticCardDataset(Dataset):
             np.array(img).reshape(-1, 3).mean(axis=0).astype(np.uint8).tolist()
         )
 
+    def _add_sensor_noise(self, img):
+        """Simulate high ISO grain (color noise)."""
+        if random.random() > 0.7:
+            return img
+
+        arr = np.array(img).astype(np.float32)
+        h, w, c = arr.shape
+
+        # Grain strength
+        sigma = random.uniform(5, 20)
+        noise = np.random.normal(0, sigma, (h, w, c))
+
+        arr = arr + noise
+        arr = np.clip(arr, 0, 255).astype(np.uint8)
+        return Image.fromarray(arr)
+
     # --------------------------------------------------------
     # Camera imperfections
     # --------------------------------------------------------
@@ -416,44 +434,57 @@ class SyntheticCardDataset(Dataset):
         x1, y1, x2, y2 = rect
         w, h = x2 - x1, y2 - y1
         cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-        color = tuple(c / 255 for c in rgb)
-        face = color if fill_type == "solid" else (0, 0, 0, 0)
 
-        # Variable line width
-        if fill_type == "empty":
-            linewidth = random.uniform(0.8, 2.5)
-        elif fill_type == "striped":
-            linewidth = random.uniform(0.5, 1.5)
-        else:
-            linewidth = 0.5
+        base_color = [c / 255.0 for c in rgb]
 
+        if fill_type == "solid":
+            # Solids: slight transparency to mimic ink absorption
+            alpha = random.uniform(0.90, 1.0)
+            face_color = (*base_color, alpha)
+            edge_color = (*base_color, 1.0)
+            linewidth = 0.0
+        elif fill_type == "empty":
+            face_color = (0, 0, 0, 0)
+            edge_color = (*base_color, 1.0)
+            linewidth = random.uniform(1, 2)  # Thicker lines to be visible at 160px
+        else:  # Striped
+            face_color = (0, 0, 0, 0)
+            edge_color = (*base_color, 1.0)
+            linewidth = random.uniform(1.0, 2.0)
+
+        # Create Patch
         if shape == "oval":
             patch = patches.FancyBboxPatch(
                 (x1, y1),
                 w,
                 h,
                 boxstyle=f"round,pad=0,rounding_size={h / 2}",
-                edgecolor=color,
-                facecolor=face,
+                edgecolor=edge_color,
+                facecolor=face_color,
                 linewidth=linewidth,
             )
         elif shape == "diamond":
             verts = [(cx, y1), (x2, cy), (cx, y2), (x1, cy)]
             patch = patches.Polygon(
-                verts, closed=True, edgecolor=color, facecolor=face, linewidth=linewidth
+                verts,
+                closed=True,
+                edgecolor=edge_color,
+                facecolor=face_color,
+                linewidth=linewidth,
             )
         else:
             path = _build_squiggle_path_in_rect(x1, y1, x2, y2)
             patch = patches.PathPatch(
-                path, edgecolor=color, facecolor=face, linewidth=linewidth
+                path, edgecolor=edge_color, facecolor=face_color, linewidth=linewidth
             )
 
         ax.add_patch(patch)
 
         if fill_type == "striped":
-            # Angled stripes
-            spacing = random.uniform(1.8, 3)
-            angle_deg = random.uniform(-20, 20)
+            # Wider spacing to prevent "Solid" confusion
+            spacing = random.uniform(2.5, 5.0)
+
+            angle_deg = random.uniform(-25, 25)
             angle_rad = np.radians(angle_deg)
             diameter = np.sqrt(w**2 + h**2) * 1.5
             num_lines = int(diameter / spacing)
@@ -466,11 +497,12 @@ class SyntheticCardDataset(Dataset):
                 ly1 = offset * sin_a + (-diameter / 2) * cos_a
                 lx2 = offset * cos_a - (diameter / 2) * sin_a
                 ly2 = offset * sin_a + (diameter / 2) * cos_a
+                # Use solid color for stripes, no alpha
                 ax.plot(
                     [cx + lx1, cx + lx2],
                     [cy + ly1, cy + ly2],
-                    color=color,
-                    linewidth=0.7,
+                    color=edge_color,
+                    linewidth=linewidth / 2,
                     clip_path=patch,
                 )
 
@@ -501,13 +533,21 @@ class SyntheticCardDataset(Dataset):
         rgb = jitter_hue_saturation(color_name)
 
         w = h = self.img_size
-        scale = random.uniform(0.85, 1.05)
-        shape_w = (w / 2.6) * scale
-        shape_h = (h / 5.2) * scale
+        # 1. Independent Scaling (Fixes Shape "Fatness")
+        # Allow shapes to be slightly fatter/thinner independently
+        scale_w = random.uniform(0.80, 1.10)
+        scale_h = random.uniform(0.80, 1.10)
+
+        shape_w = (w / 2.6) * scale_w
+        shape_h = (h / 5.2) * scale_h
 
         cx = w / 2 + random.randint(-10, 10)
         cy = h / 2 + random.randint(-10, 10)
-        spacing = shape_h * 1.45
+
+        # 2. Random Spacing (Fixes Count 2 vs 3)
+        # 1.4 is tight, 1.7 is loose.
+        spacing_mult = random.uniform(1.35, 1.65)
+        spacing = shape_h * spacing_mult
 
         if count_val == 1:
             centers = [(cx, cy)]
@@ -571,6 +611,11 @@ class SyntheticCardDataset(Dataset):
                 ],
                 resample=Image.BICUBIC,
             )
+
+        # --------------------------------------------------------
+        # STEP 3 — Sensor noise
+        # --------------------------------------------------------
+        img = self._add_sensor_noise(img)
 
         # --------------------------------------------------------
         # STEP 4 — Camera-like imperfections
@@ -725,11 +770,17 @@ def train_classifier(
     train_transform = transforms.Compose(
         [
             transforms.Resize(
-                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
+                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BICUBIC
             ),
             transforms.ColorJitter(
-                brightness=0.3, contrast=0.3, saturation=0.5, hue=0.005
+                brightness=0.2, contrast=0.3, saturation=0.8, hue=0.005
             ),
+            transforms.RandomAdjustSharpness(
+                sharpness_factor=1.5, p=0.3
+            ),  # Make some crisp
+            transforms.RandomAdjustSharpness(
+                sharpness_factor=0.5, p=0.3
+            ),  # Make some blurry
             transforms.RandomGrayscale(p=0.05),
             transforms.RandomRotation(15),
             transforms.RandomPerspective(distortion_scale=0.15, p=0.4),
@@ -742,7 +793,7 @@ def train_classifier(
     val_transform = transforms.Compose(
         [
             transforms.Resize(
-                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BOX
+                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BICUBIC
             ),
             transforms.ToTensor(),
             # transforms.Normalize([0.5, 0.5, 0.5], [0.2, 0.2, 0.2]),
@@ -755,7 +806,7 @@ def train_classifier(
         all_labels = json.load(f)
 
     all_images = list(all_labels.keys())
-    random.seed(42)
+    random.seed(71)
     random.shuffle(all_images)
     train_size = int(0.7 * len(all_images))
 
@@ -791,7 +842,7 @@ def train_classifier(
 
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=1e-3,  # peak LR
+        max_lr=5e-4,  # peak LR
         steps_per_epoch=len(synth_loader),
         epochs=epochs_pretrain + epochs_finetune,
         pct_start=0.10,  # warmup %
@@ -1058,7 +1109,7 @@ def test(image_path: str):
     print(f"\nAnnotated image saved: {output_path}")
 
 
-def analyze_failures(model_path="runs/card_classifier_best.pt"):
+def analyze_failures(model_path="runs/card_classifier_mn4s_v3.pt"):
     from torchvision.utils import save_image
 
     device = "mps" if torch.mps.is_available() else "cpu"
@@ -1150,12 +1201,10 @@ def find_label_errors(model_path="runs/card_classifier_best.pt"):
     )
     model.eval().to(device)
 
-    # Transform (Standard validation transform)
-    # Note: Use 160 or 128 depending on what you trained with last
     val_transform = transforms.Compose(
         [
             transforms.Resize(
-                (160, 160), interpolation=transforms.InterpolationMode.BICUBIC
+                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BICUBIC
             ),
             transforms.ToTensor(),
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
@@ -1240,7 +1289,7 @@ def test_onnx(image_path: str):
         "../docs/segmentationv3.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "runs/card_classifier_lcnet_v2.onnx", providers=["CPUExecutionProvider"]
+        "runs/card_classifier_mn4s_v3.onnx", providers=["CPUExecutionProvider"]
     )
     print("Cls Inputs: ", clf_sess.get_inputs()[0].shape)
 
@@ -1451,7 +1500,7 @@ def export():
                 init.data_location = onnx.TensorProto.DEFAULT
                 init.raw_data = array.tobytes()
 
-        onnx.save(model, "runs/card_classifier_mn4s_v2.onnx")
+        onnx.save(model, "runs/card_classifier_mn4s_v3.onnx")
 
         print(f"Classifier exported: runs/card_classifier.onnx")
 
