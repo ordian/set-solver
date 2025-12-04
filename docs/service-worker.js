@@ -1,4 +1,4 @@
-const CACHE_NAME = "set-detector-cache-v2";
+const CACHE_NAME = "set-detector-cache-v3";
 
 const ASSETS = [
   "/",
