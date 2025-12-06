@@ -1,4 +1,4 @@
-const CACHE_NAME = "set-detector-cache-v3";
+const CACHE_NAME = "set-detector-cache-v4";
 
 const ASSETS = [
   "/",
@@ -7,7 +7,7 @@ const ASSETS = [
   "/icon-192.png",
   "/icon-512.png",
   "/segmentationv3.onnx",
-  "/classificationv3.onnx",
+  "/classificationv4.onnx",
 ];
 
 // Install SW and cache assets

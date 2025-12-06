@@ -36,8 +36,6 @@ import json
 import random
 import shutil
 import sys
-from functools import reduce
-from operator import mul
 from pathlib import Path
 
 import matplotlib.patches as patches
@@ -428,6 +426,38 @@ class SyntheticCardDataset(Dataset):
         img_arr = np.clip(img_arr, 0, 255).astype(np.uint8)
         return Image.fromarray(img_arr)
 
+    def _simulate_extreme_lighting(self, img):
+        """Simulate bad lighting: Red Room, Blue Night, Dim Candle."""
+        if random.random() > 0.35:
+            return img  # Apply to 35% of synthetic data
+
+        arr = np.array(img).astype(np.float32)
+
+        # Scenario 1: The "Red Room" (Matches your new photos)
+        # Characteristics: Red blown out, Green/Blue crushed to black
+        if random.random() < 0.6:
+            r_gain = random.uniform(1.1, 1.4)
+            g_gain = random.uniform(0.4, 0.7)  # Green becomes dark grey
+            b_gain = random.uniform(0.4, 0.7)  # Purple loses blue, looks dark
+
+        # Scenario 2: "Cool/Dim" (General robustness)
+        else:
+            r_gain = random.uniform(0.6, 0.9)
+            g_gain = random.uniform(0.8, 1.0)
+            b_gain = random.uniform(0.9, 1.2)
+
+        arr[..., 0] *= r_gain
+        arr[..., 1] *= g_gain
+        arr[..., 2] *= b_gain
+
+        # Add High ISO Color Noise (Chroma Noise)
+        # Real dark photos have colorful speckles, not just gaussian blur
+        h, w, c = arr.shape
+        noise = np.random.normal(0, random.uniform(10, 30), (h, w, c))
+        arr += noise
+
+        return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+
     # ------------------------------------------------------------
     # Draw a single shape
     # ------------------------------------------------------------
@@ -613,6 +643,7 @@ class SyntheticCardDataset(Dataset):
                 resample=Image.BICUBIC,
             )
 
+        img = self._simulate_extreme_lighting(img)
         # --------------------------------------------------------
         # STEP 3 — Sensor noise
         # --------------------------------------------------------
@@ -819,147 +850,131 @@ def train_classifier(
     train_labels_path.write_text(json.dumps(train_labels))
     val_labels_path.write_text(json.dumps(val_labels))
 
-    real_train_ds = RealCardDataset(crops_dir, train_labels_path, train_transform)
-    real_val_ds = RealCardDataset(crops_dir, val_labels_path, val_transform)
+    real_train = RealCardDataset(crops_dir, train_labels_path, train_transform)
+    real_val = RealCardDataset(crops_dir, val_labels_path, val_transform)
 
-    val_loader = DataLoader(real_val_ds, batch_size=batch_size)
-
-    # Synthetic dataset
-    synth_pretrain = SyntheticCardDataset(length=8000, img_size=IMG_SIZE)
-    synth_loader = DataLoader(synth_pretrain, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(real_val, batch_size=batch_size)
+    synth_loader = DataLoader(
+        SyntheticCardDataset(8000), batch_size=batch_size, shuffle=True
+    )
 
     model = CardClassifier(freeze_backbone=True).to(device)
-    # EMA Setup
+
+    # EMA helps significantly with stability
     model_ema = ModelEmaV2(model, decay=0.995)
 
-    # --------------------------------------
-    # Learning rate scheduling (warmup + cosine)
-    # --------------------------------------
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=7e-4,
-        weight_decay=0.01,
-    )
+    # Optimizer
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.01)
 
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=5e-4,  # peak LR
+    # Full Schedule
+    total_epochs = epochs_pt + epochs_ft
+    sched = torch.optim.lr_scheduler.OneCycleLR(
+        opt,
+        max_lr=1e-3,
+        epochs=total_epochs,
         steps_per_epoch=len(synth_loader),
-        epochs=epochs_pretrain + epochs_finetune,
-        pct_start=0.10,  # warmup %
-        div_factor=10,  # initial LR = max_lr/10
-        final_div_factor=20,  # cooldown
-        anneal_strategy="cos",
+        pct_start=0.1,
     )
-    criterion_color = nn.CrossEntropyLoss(label_smoothing=0.15)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
 
-    def calc_loss(outs, targs, finetuning=False):
-        m = 2.0 if finetuning else 1.0
-        loss = m * criterion_color(outs[0], targs[:, 0].argmax(dim=1))
-        for i in range(1, 4):
-            loss += criterion(outs[i], targs[:, i].argmax(dim=1))
-        return loss
+    crit = nn.CrossEntropyLoss(label_smoothing=0.05)
+    crit_c = nn.CrossEntropyLoss(label_smoothing=0.15)
 
     def validate():
-        test_model = model_ema.module
-        test_model.eval()
-        correct_attrs = [0, 0, 0, 0]
-        perfect_cards = 0
+        model_ema.module.eval()
+        correct = [0] * 4
+        perfect = 0
         total = 0
         with torch.no_grad():
-            for imgs, targs in val_loader:
-                imgs, targs = imgs.to(device), targs.to(device)
-                outs = test_model(imgs)
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                outs = model_ema.module(x)
 
-                # Stack predictions: Tuple of 4x(B, 3) -> Tensor (B, 4)
-                preds = torch.stack([out.argmax(dim=1) for out in outs], dim=1)
+                preds = torch.stack([o.argmax(1) for o in outs], 1)
+                trues = y.argmax(2)
 
-                # Stack targets: Tensor (B, 4, 3) -> Tensor (B, 4)
-                # We simply argmax the one-hot encoding at the last dimension
-                trues = targs.argmax(dim=2)
-
-                # Check individual attributes
                 for i in range(4):
-                    correct_attrs[i] += (preds[:, i] == trues[:, i]).sum().item()
+                    correct[i] += (preds[:, i] == trues[:, i]).sum().item()
 
-                # Check perfect matches (rows where all columns match)
-                perfect_match = (preds == trues).all(dim=1)
-                perfect_cards += perfect_match.sum().item()
-
-                total += imgs.size(0)
-        return [c / total * 100 for c in correct_attrs], perfect_cards / total * 100
+                perfect += (preds == trues).all(1).sum().item()
+                total += x.size(0)
+        return [c / total * 100 for c in correct], perfect / total * 100
 
     Path("runs").mkdir(exist_ok=True)
-    best_acc = 0
+    best_joint = 0.0
 
-    # Phase 1: Pretrain on synthetic data
-    print(f"\n=== Phase 1: Synthetic Pretraining ({epochs_pretrain} epochs) ===")
-    for epoch in range(epochs_pretrain):
+    print(f"\n=== Phase 1: Synthetic Pretraining ({epochs_pt} eps) ===")
+    # Learning the "Red Room" physics from pure synthetic data first
+    for ep in range(epochs_pt):
         model.train()
         total_loss = 0
-        for imgs, targs in synth_loader:
-            imgs, targs = imgs.to(device), targs.to(device)
-            optimizer.zero_grad()
-            outs = model(imgs)
-            loss = calc_loss(outs, targs)
+        for x, y in synth_loader:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            outs = model(x)
+            loss = crit_c(outs[0], y[:, 0].argmax(1)) + sum(
+                crit(outs[i], y[:, i].argmax(1)) for i in range(1, 4)
+            )
             loss.backward()
-            optimizer.step()
+            opt.step()
             model_ema.update(model)
-            scheduler.step()
+            sched.step()
             total_loss += loss.item()
-        accs, joint = validate()
+
+        acc, joint = validate()
         print(
-            f"Epoch {epoch + 1} - Loss: {total_loss / len(synth_loader):.3f} - Val: C={accs[0]:.1f}% (Joint Perfect={joint:.1f}%)"
+            f"Ep {ep + 1}: Loss={total_loss / len(synth_loader):.3f} | Joint={joint:.1f}% (C={acc[0]:.1f}%)"
         )
 
-    # Phase 2: Finetune on mixed real + synthetic
-    print(f"\n=== Phase 2: Mixed Finetuning ({epochs_finetune} epochs) ===")
-    mixed_ds = ConcatDataset(
-        [real_train_ds] * 4 + [SyntheticCardDataset(length=1000, img_size=IMG_SIZE)]
+    print(f"\n=== Phase 2: Mixed Finetuning ({epochs_ft} eps) ===")
+    # 5x oversampling of real data to anchor the synthetic knowledge
+    mixed = DataLoader(
+        ConcatDataset([real_train] * 5 + [SyntheticCardDataset(1000)]),
+        batch_size=batch_size,
+        shuffle=True,
     )
-    mixed_loader = DataLoader(mixed_ds, batch_size=batch_size, shuffle=True)
 
-    for epoch in range(epochs_finetune):
-        # Unfreeze backbone after 5 epochs
-        if epoch == 4:
+    for ep in range(epochs_ft):
+        if ep == 4:
             print(">>> Unfreezing backbone")
             model.unfreeze_backbone()
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": model.backbone.parameters(), "lr": 1e-4},
-                    {"params": model.head_color.parameters(), "lr": 5e-4},
-                    {"params": model.head_shape.parameters(), "lr": 3e-4},
-                    {"params": model.head_fill.parameters(), "lr": 3e-4},
-                    {"params": model.head_count.parameters(), "lr": 3e-4},
-                ],
-                weight_decay=0.01,
+            # Reset optimizer for the full model
+            opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=0.01)
+            # New schedule for the remaining epochs
+            sched = torch.optim.lr_scheduler.OneCycleLR(
+                opt,
+                max_lr=2e-4,
+                epochs=epochs_ft - 4,
+                steps_per_epoch=len(mixed),
+                pct_start=0.1,
             )
 
         model.train()
         total_loss = 0
-        for imgs, targs in mixed_loader:
-            imgs, targs = imgs.to(device), targs.to(device)
-            optimizer.zero_grad()
-            outs = model(imgs)
-            loss = calc_loss(outs, targs, finetuning=True)
+        for x, y in mixed:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            outs = model(x)
+            # Weighted loss for Color (since that's the hardest part now)
+            loss = 2.0 * crit_c(outs[0], y[:, 0].argmax(1)) + sum(
+                crit(outs[i], y[:, i].argmax(1)) for i in range(1, 4)
+            )
             loss.backward()
-            optimizer.step()
+            opt.step()
             model_ema.update(model)
-            scheduler.step()
+            if ep >= 4:
+                sched.step()
             total_loss += loss.item()
 
-        accs, joint = validate()
+        acc, joint = validate()
         print(
-            f"Epoch {epoch + 1} - Loss: {total_loss / len(mixed_loader):.3f} - Val: C={accs[0]:.1f}% S={accs[1]:.1f}% F={accs[2]:.1f}% N={accs[3]:.1f}% (Joint Perfect={joint:.1f}%)"
+            f"Ep {ep + 1}: Loss={total_loss / len(mixed):.3f} | Joint={joint:.1f}% (C={acc[0]:.1f}%)"
         )
 
-        if joint > best_acc:
-            best_acc = joint
+        if joint >= best_joint:
+            best_joint = joint
             torch.save(model_ema.module.state_dict(), "runs/card_classifier_best.pt")
 
-    torch.save(model_ema.module.state_dict(), "runs/card_classifier.pt")
-    print(f"\nTraining complete. Best accuracy: {best_acc:.1f}%")
+    torch.save(model_ema.module.state_dict(), "runs/card_classifier_last.pt")
 
 
 # ============================================
@@ -1110,7 +1125,7 @@ def test(image_path: str):
     print(f"\nAnnotated image saved: {output_path}")
 
 
-def analyze_failures(model_path="runs/card_classifier.pt"):
+def analyze_failures(model_path="runs/card_classifier_best.pt"):
     from torchvision.utils import save_image
 
     device = "mps" if torch.mps.is_available() else "cpu"
@@ -1176,7 +1191,7 @@ def analyze_failures(model_path="runs/card_classifier.pt"):
 # ============================================
 # Data Cleaning Tools
 # ============================================
-def find_label_errors(model_path="runs/card_classifier.pt"):
+def find_label_errors(model_path="runs/card_classifier_best.pt"):
     """
     1. Runs inference on ALL real crops.
     2. If Prediction != Label, saves image to 'suspicious_labels/'
@@ -1275,6 +1290,151 @@ def find_label_errors(model_path="runs/card_classifier.pt"):
     print(f"5. Run 'uv run train_simple.py fix-labels' to apply the changes.")
 
 
+def ingest_hard_examples(image_path: str):
+    """
+    1. Detects cards using YOLO (assumes detector weights exist).
+    2. Classifies using the ONNX model (since PT is lost).
+    3. Asks user to correct label.
+    4. Saves crop for training.
+    """
+    import matplotlib.pyplot as plt
+    import onnxruntime as ort
+    from ultralytics import YOLO
+
+    # Paths
+    # Ensure this matches your exported filename
+    onnx_path = "../docs/classificationv3.onnx"
+    detector_path = "runs/card_detector/weights/best.pt"
+
+    if not Path(onnx_path).exists():
+        print(f"Error: ONNX model not found at {onnx_path}")
+        return
+
+    # 1. Load Detector
+    print(f"Loading Detector: {detector_path}")
+    detector = YOLO(detector_path)
+
+    # 2. Load ONNX Classifier
+    print(f"Loading ONNX Classifier: {onnx_path}")
+    # Providers: Try MPS (Mac) or CUDA if available, else CPU
+    providers = ["CPUExecutionProvider"]
+    sess = ort.InferenceSession(onnx_path, providers=providers)
+    input_name = sess.get_inputs()[0].name
+
+    # Transform (Must match training exactly to get good predictions)
+    # We use PyTorch transforms for consistency, then convert to Numpy
+    tfm = transforms.Compose(
+        [
+            transforms.Resize(
+                (IMG_SIZE, IMG_SIZE), interpolation=transforms.InterpolationMode.BICUBIC
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ]
+    )
+
+    # Load Labels Data
+    labels_path = DATASET_DIR / "classifier" / "labels.json"
+    with open(labels_path) as f:
+        all_labels = json.load(f)
+
+    # Process Image
+    src_img = Image.open(image_path).convert("RGB")
+    results = detector.predict(src_img, conf=0.5, verbose=False)
+
+    print(f"Found {len(results[0].boxes)} cards. Starting manual review...")
+
+    # Sort boxes top-to-bottom, left-to-right
+    boxes = sorted(results[0].boxes.xyxy.tolist(), key=lambda b: (b[1], b[0]))
+
+    for i, box in enumerate(boxes):
+        x1, y1, x2, y2 = map(int, box)
+        crop = src_img.crop((x1, y1, x2, y2))
+
+        # Preprocess for ONNX
+        img_t = tfm(crop).unsqueeze(0)  # Add batch dim -> (1, 3, 160, 160)
+        img_np = img_t.numpy()  # Convert to Numpy
+
+        # Inference
+        # Returns list of numpy arrays: [color_logits, shape_logits, fill_logits, count_logits]
+        outs = sess.run(None, {input_name: img_np})
+
+        # Decode (Argmax)
+        pred_c = COLORS[np.argmax(outs[0])]
+        pred_s = SHAPES[np.argmax(outs[1])]
+        pred_f = FILLS[np.argmax(outs[2])]
+        pred_n = COUNTS[np.argmax(outs[3])]
+
+        # Show UI
+        plt.figure(figsize=(3, 4))
+        plt.imshow(crop)
+        plt.title(f"Model: {pred_n} {pred_c} {pred_s} {pred_f}")
+        plt.axis("off")
+        plt.show(block=False)
+        plt.pause(0.1)
+
+        print(f"\n--- Card {i + 1} ---")
+        print(f"Model Prediction: {pred_n} {pred_c} {pred_s} {pred_f}")
+
+        # Input loop
+        while True:
+            user_input = (
+                input(
+                    "Correct? [Enter]=Yes, 's'=Skip, or type label (e.g. 'one red oval solid'): "
+                )
+                .strip()
+                .lower()
+            )
+
+            if user_input == "s":
+                print("Skipping.")
+                final_n = None
+                break
+            elif user_input == "":
+                # Accept model prediction
+                final_c, final_s, final_f, final_n = pred_c, pred_s, pred_f, pred_n
+                break
+            else:
+                # Parse manual input
+                parts = user_input.split()
+                if len(parts) == 4:
+                    # Validate
+                    if (
+                        parts[0] in COUNTS
+                        and parts[1] in COLORS
+                        and parts[2] in SHAPES
+                        and parts[3] in FILLS
+                    ):
+                        final_n, final_c, final_s, final_f = parts
+                        break
+                    else:
+                        print("Typo detected. Use format: 'count color shape fill'")
+                        print(f"Options: {COUNTS} {COLORS} {SHAPES} {FILLS}")
+                else:
+                    print("Invalid format. Need 4 words: count color shape fill")
+
+        plt.close()
+
+        if final_n:
+            # Save cropped image with unique name
+            filename = f"hard_{Path(image_path).stem}_{i}.jpg"
+            save_path = DATASET_DIR / "classifier" / "crops" / filename
+            crop.save(save_path)
+
+            all_labels[filename] = {
+                "color": final_c,
+                "shape": final_s,
+                "fill": final_f,
+                "count": final_n,
+            }
+            print(f"Saved -> {filename}")
+
+    # Write back labels
+    with open(labels_path, "w") as f:
+        json.dump(all_labels, f, indent=2)
+    print("\nLabels updated! Run training to finetune.")
+
+
 def test_onnx(image_path: str):
     """Test full detection + classification pipeline using ONNX models."""
     from pathlib import Path
@@ -1290,7 +1450,7 @@ def test_onnx(image_path: str):
         "../docs/segmentationv3.onnx", providers=["CPUExecutionProvider"]
     )
     clf_sess = ort.InferenceSession(
-        "../docs/classificationv2.onnx", providers=["CPUExecutionProvider"]
+        "../docs/classificationv4.onnx", providers=["CPUExecutionProvider"]
     )
     print("Cls Inputs: ", clf_sess.get_inputs()[0].shape)
 
@@ -1467,7 +1627,7 @@ def export():
         )
         print(f"Detector exported")
 
-    classifier_path = "runs/card_classifier.pt"
+    classifier_path = "runs/card_classifier_best.pt"
     if Path(classifier_path).exists():
         model = CardClassifier(freeze_backbone=False)
         model.load_state_dict(
@@ -1509,7 +1669,7 @@ def export():
                 init.data_location = onnx.TensorProto.DEFAULT
                 init.raw_data = array.tobytes()
 
-        onnx.save(model, "runs/card_classifier_mn4s_v3.onnx")
+        onnx.save(model, "runs/card_classifier_single.onnx")
 
         print(f"Classifier exported: runs/card_classifier.onnx")
 
@@ -1606,6 +1766,8 @@ if __name__ == "__main__":
         train_classifier(epochs_pt, epochs_ft)
     elif cmd == "export":
         export()
+    elif cmd == "ingest":
+        ingest_hard_examples(sys.argv[2])
     elif cmd == "analyze-failures":
         analyze_failures()
     elif cmd == "find-errors":
